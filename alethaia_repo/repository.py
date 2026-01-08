@@ -896,6 +896,17 @@ class AletheiaRepository:
 
             scan_params = record.get("scan_params", {})
 
+            # Extract with legacy fallback (canonical keys use _bytes suffix)
+            window_size_bytes = scan_params.get(
+                "window_size_bytes", scan_params.get("window_size", 65536)
+            )
+            step_size_bytes = scan_params.get(
+                "step_size_bytes", scan_params.get("step_size", 16384)
+            )
+            m_block_size = scan_params.get("m_block_size", 1)
+            quant_version = scan_params.get("quant_version", "v0")
+            barcode_len = scan_params.get("barcode_len", 0)
+
             cursor.execute(
                 """
                 INSERT OR REPLACE INTO artifacts (
@@ -913,11 +924,11 @@ class AletheiaRepository:
                     content_obj_id,
                     barcode_obj_id,
                     record.get("created_at_unix_ms", self._unix_ms()),
-                    scan_params.get("window_size_bytes", 65536),
-                    scan_params.get("step_size_bytes", 16384),
-                    scan_params.get("m_block_size", 1),
-                    scan_params.get("quant_version", "v0"),
-                    scan_params.get("barcode_len", 0),
+                    window_size_bytes,
+                    step_size_bytes,
+                    m_block_size,
+                    quant_version,
+                    barcode_len,
                 ),
             )
 

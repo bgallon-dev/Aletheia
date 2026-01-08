@@ -55,25 +55,18 @@ def parse_common_args(args: list) -> tuple[list, dict]:
 def cmd_ingest(args: list) -> int:
     """Ingest command - now calls IngestPipeline directly."""
     if len(args) < 1:
-        print("Usage: repo ingest <file> [options]", file=sys.stderr)
-        print("\nOptions:", file=sys.stderr)
-        print("  --window <bytes>     Window size (default: 65536)", file=sys.stderr)
-        print("  --step <bytes>       Step size (default: 16384)", file=sys.stderr)
-        print("  --m <1|2>            Block size (default: 1)", file=sys.stderr)
-        print("  --threads <N>        Thread count (default: auto)", file=sys.stderr)
-        print("  --repo <path>        Repository root (default: .)", file=sys.stderr)
-        print(
-            "  --no-auto-init       Don't auto-initialize repository", file=sys.stderr
-        )
-        print("  --quiet              Suppress output", file=sys.stderr)
-        print("  --keep-temp          Keep temporary .albc file", file=sys.stderr)
-        print(
-            "  --sign <key_id>      Sign artifact with this key", file=sys.stderr
-        )  # NEW
-        print(
-            "  --passphrase         Prompt for key passphrase", file=sys.stderr
-        )  # NEW
-        return 2
+        print("Usage: repo ingest <file> [options]")
+        print("Options:")
+        print("  --window <size>      Window size (default: 65536)")
+        print("  --step <size>        Step size (default: 16384)")
+        print("  --m <size>           Block size (default: 1)")
+        print("  --threads <n>        Thread count (default: auto)")
+        print("  --format <version>   ALBC format: 1 (quantized) or 2 (quantized+raw)")
+        print("  --sign <key_id>      Sign with identity key")
+        print("  --passphrase         Prompt for signing passphrase")
+        print("  --repo <path>        Repository root (default: .)")
+        print("  --quiet              Suppress output")
+        return 1
 
     file_path = args[0]
     remaining, common = parse_common_args(args[1:])
@@ -86,15 +79,17 @@ def cmd_ingest(args: list) -> int:
         "threads": 0,
         "verbose": common["verbose"],
         "keep_temp": False,
-        "sign_with": None,  # NEW
-        "passphrase": None,  # NEW
+        "sign_with": None,
+        "passphrase": None,
+        "output_format": 1,  # NEW: Default to v1
     }
     auto_init = True
-    prompt_passphrase = False  # NEW
+    prompt_passphrase = False
 
     i = 0
     while i < len(remaining):
         arg = remaining[i]
+
         if arg == "--window" and i + 1 < len(remaining):
             kwargs["window_size"] = int(remaining[i + 1])
             i += 2
@@ -107,21 +102,23 @@ def cmd_ingest(args: list) -> int:
         elif arg == "--threads" and i + 1 < len(remaining):
             kwargs["threads"] = int(remaining[i + 1])
             i += 2
-        elif arg == "--no-auto-init":
-            auto_init = False
+        elif arg == "--format" and i + 1 < len(remaining):  # NEW
+            kwargs["output_format"] = int(remaining[i + 1])
+            i += 2
+        elif arg == "--sign" and i + 1 < len(remaining):
+            kwargs["sign_with"] = remaining[i + 1]
+            i += 2
+        elif arg == "--passphrase":
+            prompt_passphrase = True
             i += 1
         elif arg == "--keep-temp":
             kwargs["keep_temp"] = True
             i += 1
-        elif arg == "--sign" and i + 1 < len(remaining):  # NEW
-            kwargs["sign_with"] = remaining[i + 1]
-            i += 2
-        elif arg == "--passphrase":  # NEW
-            prompt_passphrase = True
+        elif arg == "--no-init":
+            auto_init = False
             i += 1
         else:
-            print(f"Unknown argument: {arg}", file=sys.stderr)
-            return 2
+            i += 1
 
     # NEW: Prompt for passphrase if requested
     if prompt_passphrase and kwargs["sign_with"]:
@@ -235,14 +232,39 @@ def cmd_show(args: list) -> int:
 
         scan_params = record.get("scan_params", {})
         if scan_params:
+            # Extract with legacy fallback (canonical keys use _bytes suffix)
+            window_size = scan_params.get(
+                "window_size_bytes", scan_params.get("window_size")
+            )
+            step_size = scan_params.get("step_size_bytes", scan_params.get("step_size"))
+            m_block = scan_params.get("m_block_size")
+            quant_ver = scan_params.get("quant_version")
+            barcode_len = scan_params.get("barcode_len")
+            format_ver = scan_params.get("format_version", 1)
+
             print(f"\nScan Parameters:")
             print(
-                f"  Window Size:   {scan_params.get('window_size_bytes', 'N/A')} bytes"
+                f"  Window Size:   {window_size} bytes"
+                if window_size
+                else "  Window Size:   N/A"
             )
-            print(f"  Step Size:     {scan_params.get('step_size_bytes', 'N/A')} bytes")
-            print(f"  Block Size:    m={scan_params.get('m_block_size', 'N/A')}")
-            print(f"  Quantization:  {scan_params.get('quant_version', 'N/A')}")
-            print(f"  Barcode Len:   {scan_params.get('barcode_len', 'N/A')} windows")
+            print(
+                f"  Step Size:     {step_size} bytes"
+                if step_size
+                else "  Step Size:     N/A"
+            )
+            print(
+                f"  Block Size:    m={m_block}" if m_block else "  Block Size:    N/A"
+            )
+            print(
+                f"  Quantization:  {quant_ver}" if quant_ver else "  Quantization:  N/A"
+            )
+            print(
+                f"  Barcode Len:   {barcode_len} windows"
+                if barcode_len
+                else "  Barcode Len:   N/A"
+            )
+            print(f"  Format:        ALBC v{format_ver}")
 
         metadata = record.get("metadata", {})
         if metadata:

@@ -273,16 +273,20 @@ class ArtifactVerifier:
         file_path: str,
         verbose: bool = True,
         enable_zoom: bool = True,
-        trusted_keys: Optional[Dict[str, str]] = None,  # NEW
+        trusted_keys: Optional[Dict[str, str]] = None,
     ) -> VerificationResult:
-        """Verify a file against a stored artifact record.
+        """
+        Verify a file against its stored artifact record.
 
         Args:
-            artifact_id: The ID of the artifact to verify
-            file_path: The path to the file to verify
-            verbose: Enable verbose output
-            enable_zoom: Enable zoom scan for modified regions
+            artifact_id: The artifact ID to verify against
+            file_path: Path to the file to verify
+            verbose: Print progress info
+            enable_zoom: Enable zoom scan on forensic mismatch
             trusted_keys: Optional dict of key_id -> public_key_b64 for signature verification
+
+        Returns:
+            VerificationResult with cryptographic and forensic verification status
         """
         result = VerificationResult()
 
@@ -332,58 +336,40 @@ class ArtifactVerifier:
             print("\n[2/2] Forensic identity check (barcode)...")
 
         try:
-            # Extract scan parameters from record
+            # Extract scan parameters from record (with legacy fallback)
             scan_params = record.get("scan_params", {})
-            window_size = scan_params.get("window_size_bytes", 65536)
-            step_size = scan_params.get("step_size_bytes", 16384)
+
+            # Canonical keys use _bytes suffix; legacy keys don't
+            window_size = scan_params.get(
+                "window_size_bytes", scan_params.get("window_size", 65536)
+            )
+            step_size = scan_params.get(
+                "step_size_bytes", scan_params.get("step_size", 16384)
+            )
             m = scan_params.get("m_block_size", 1)
+            stored_format_version = scan_params.get("format_version", 1)
 
-            # PRE-CHECK: File size compatibility with scanning parameters
-            if file_size < window_size:
-                result.warnings.append(
-                    f"File ({file_size} bytes) is smaller than scan window ({window_size} bytes). "
-                    f"Scanner will use one-window mode."
+            if verbose:
+                print(
+                    f"  Scan params: window={window_size}, step={step_size}, m={m}, format=v{stored_format_version}"
                 )
 
-                if verbose:
-                    print(f"  ⚠ File is smaller than scan window")
-                    print(
-                        f"    File size: {file_size} bytes ({self._format_file_size(file_size)})"
-                    )
-                    print(
-                        f"    Window:    {window_size} bytes ({self._format_file_size(window_size)})"
-                    )
-                    print(
-                        f"    Scanner will compute single window covering entire file"
-                    )
+            # Re-scan with MATCHING format version
+            albc_bytes, temp_path = self.scanner.scan(
+                file_path,
+                window_size=window_size,
+                step_size=step_size,
+                m=m,
+                threads=0,
+                verbose=False,
+                output_format=stored_format_version,
+            )
 
-            # Recompute barcode
+            # Clean up temp file
             try:
-                albc_bytes, temp_path = self.scanner.scan(
-                    file_path,
-                    window_size=window_size,
-                    step_size=step_size,
-                    m=m,
-                    threads=0,
-                    verbose=False,
-                )
-
-                # Clean up temp file
-                try:
-                    Path(temp_path).unlink()
-                except OSError:
-                    pass
-
-            except Exception as scan_error:
-                result.forensic_skipped = True
-                result.forensic_skip_reason = (
-                    f"Barcode computation failed: {scan_error}"
-                )
-
-                if verbose:
-                    print(f"  ⊘ SKIPPED: {result.forensic_skip_reason}")
-
-                return result
+                Path(temp_path).unlink()
+            except OSError:
+                pass
 
             # Compare barcode hash
             result.barcode_hash_actual = hashlib.sha256(albc_bytes).hexdigest()
@@ -402,7 +388,9 @@ class ArtifactVerifier:
                     print("\n[Coarse Localization] Analyzing modified regions...")
 
                 # Load stored barcode from object store
-                stored_albc = self.repo.get_object(result.barcode_hash_expected)
+                stored_albc = self.repo.get_object_bytes(
+                    result.barcode_hash_expected, obj_type_hint="barcode"
+                )
                 if stored_albc:
                     # Parse both barcodes
                     stored_parsed = self.parser.parse_full(stored_albc)
@@ -609,13 +597,11 @@ class ArtifactVerifier:
                             else:
                                 if in_diff:
                                     # End of difference region
-                                    start_byte = (
-                                        zoom_start + diff_start_win * ZOOM_STEP_SIZE
-                                    )
+                                    # Store RELATIVE byte offsets (relative to zoom_start_byte)
+                                    # format_report() will add zoom_start_byte when displaying
+                                    start_byte = diff_start_win * ZOOM_STEP_SIZE
                                     end_byte = (
-                                        zoom_start
-                                        + win_idx * ZOOM_STEP_SIZE
-                                        + ZOOM_WINDOW_SIZE
+                                        win_idx * ZOOM_STEP_SIZE + ZOOM_WINDOW_SIZE
                                     )
                                     fine_regions.append(
                                         (diff_start_win, win_idx, start_byte, end_byte)
@@ -624,12 +610,9 @@ class ArtifactVerifier:
 
                         # Handle difference extending to end
                         if in_diff:
-                            start_byte = zoom_start + diff_start_win * ZOOM_STEP_SIZE
-                            end_byte = (
-                                zoom_start
-                                + num_windows * ZOOM_STEP_SIZE
-                                + ZOOM_WINDOW_SIZE
-                            )
+                            # Store RELATIVE byte offsets
+                            start_byte = diff_start_win * ZOOM_STEP_SIZE
+                            end_byte = num_windows * ZOOM_STEP_SIZE + ZOOM_WINDOW_SIZE
                             fine_regions.append(
                                 (diff_start_win, num_windows, start_byte, end_byte)
                             )
@@ -647,8 +630,11 @@ class ArtifactVerifier:
                                     start_byte,
                                     end_byte,
                                 ) in fine_regions[:3]:
+                                    # Add zoom_start_byte for absolute display
+                                    abs_start = zoom_region.zoom_start_byte + start_byte
+                                    abs_end = zoom_region.zoom_start_byte + end_byte
                                     print(
-                                        f"      Windows {start_win}-{end_win}: bytes {start_byte:,}-{end_byte:,}"
+                                        f"      Windows {start_win}-{end_win}: bytes {abs_start:,}-{abs_end:,}"
                                     )
                                 if len(fine_regions) > 3:
                                     print(f"      ... and {len(fine_regions) - 3} more")

@@ -822,443 +822,61 @@ write_barcode_file :: proc(path: string, meta: Barcode_Metadata, quant: []u8) ->
 	return ok
 }
 
-Barcode_File :: struct {
-	meta:  Barcode_Metadata,
+// Add after write_barcode_file proc
+write_barcode_file_v2 :: proc(
+	path: string,
+	meta: Barcode_Metadata,
 	quant: []u8,
-	_buf:  []u8, // keep underlying bytes alive if you choose not to copy
-}
+	raw: []f64,
+) -> bool {
+	if len(quant) == 0 {
+		fmt.eprintln("Error: empty barcode; nothing to write")
+		return false
+	}
 
-read_barcode_file :: proc(path: string) -> (Barcode_File, bool) {
-	bf: Barcode_File
+	// Header: 40 bytes for v2 (adds raw_data_offset)
+	ALBC_V2_HEADER_SIZE :: 40
 
-	data, ok := os.read_entire_file(path)
+	raw_data_offset: u64 = 0
+	raw_data_size := 0
+
+	if len(raw) > 0 && len(raw) == len(quant) {
+		raw_data_offset = u64(ALBC_V2_HEADER_SIZE + len(quant))
+		raw_data_size = len(raw) * size_of(f64)
+	}
+
+	total := ALBC_V2_HEADER_SIZE + len(quant) + raw_data_size
+	out := make([]u8, total)
+	defer delete(out)
+
+	// Magic "ALBC0002"
+	magic := ALBC_MAGIC_EXTENDED
+	mem.copy(&out[0], &magic[0], 8)
+
+	// Header fields (same as v1 through offset 24)
+	put_u32_le(out, 8, u32(meta.window_size_bytes))
+	put_u32_le(out, 12, u32(meta.step_size_bytes))
+	put_u32_le(out, 16, u32(meta.m_block_size))
+	put_u32_le(out, 20, u32(meta.quantization))
+	put_u64_le(out, 24, u64(len(quant)))
+
+	// New v2 field: raw data offset (0 if no raw data)
+	put_u64_le(out, 32, raw_data_offset)
+
+	// Quantized payload
+	mem.copy(&out[ALBC_V2_HEADER_SIZE], raw_data(quant), len(quant))
+
+	// Raw f64 payload (if present)
+	if raw_data_size > 0 {
+		raw_bytes := mem.slice_to_bytes(raw)
+		mem.copy(&out[int(raw_data_offset)], raw_data(raw_bytes), raw_data_size)
+	}
+
+	ok := os.write_entire_file(path, out)
 	if !ok {
-		fmt.eprintln("Error: could not read barcode file:", path)
-		return bf, false
+		fmt.eprintln("Error: could not write barcode file:", path)
 	}
-
-	if len(data) < ALBC_HEADER_SIZE || !starts_with_magic(data) {
-		fmt.eprintln("Error: invalid barcode file (bad magic or too small):", path)
-		delete(data)
-		return bf, false
-	}
-
-	ws := int(get_u32_le(data, 8))
-	ss := int(get_u32_le(data, 12))
-	m := int(get_u32_le(data, 16))
-	qv := Quantization_Version(get_u32_le(data, 20))
-	bln := int(get_u64_le(data, 24))
-
-	if bln < 0 || len(data) != ALBC_HEADER_SIZE + bln {
-		fmt.eprintln("Error: invalid barcode file length:", path)
-		delete(data)
-		return bf, false
-	}
-
-	bf.meta = Barcode_Metadata {
-		window_size_bytes   = ws,
-		step_size_bytes     = ss,
-		m_block_size        = m,
-		original_file_bytes = 0, // unknown from file; will be known at scan time
-		padded_bytes        = 0,
-		quantization        = qv,
-		barcode_len         = bln,
-	}
-
-	bf._buf = data
-	bf.quant = data[ALBC_HEADER_SIZE:] // slice into buffer (no copy)
-	return bf, true
-}
-
-destroy_barcode_file :: proc(bf: ^Barcode_File) {
-	delete(bf._buf)
-	bf.quant = nil
-}
-
-// ============================================================================
-// CLI ARG PARSING (minimal, dependency-free)
-// ============================================================================
-
-parse_i64 :: proc(s: string) -> (i64, bool) {
-	if len(s) == 0 {return 0, false}
-	sign: i64 = 1
-	i := 0
-	if s[0] == '-' {
-		sign = -1
-		i = 1
-		if len(s) == 1 {return 0, false}
-	}
-	n: i64 = 0
-	for ; i < len(s); i += 1 {
-		c := s[i]
-		if c < '0' || c > '9' {return 0, false}
-		n = n * 10 + i64(c - '0')
-	}
-	return n * sign, true
-}
-
-is_flag :: proc(s: string) -> bool {
-	return len(s) >= 2 && s[0] == '-' && s[1] == '-'
-}
-
-// ============================================================================
-// CLI COMMANDS
-// ============================================================================
-
-Scan_Opts :: struct {
-	file_path:  string,
-	out_path:   string,
-	window:     int,
-	step:       int,
-	m:          int,
-	threads:    int,
-	verbose:    bool,
-	parallel:   bool,
-	start_byte: int, // NEW: byte range start (0 = from beginning)
-	end_byte:   int, // NEW: byte range end (0 = to end of file)
-}
-
-parse_scan_opts :: proc(args: []string) -> (Scan_Opts, bool) {
-	opts := Scan_Opts {
-		window     = 64 * 1024,
-		step       = 16 * 1024,
-		m          = 1,
-		threads    = 0,
-		verbose    = true,
-		parallel   = true,
-		start_byte = 0, // NEW
-		end_byte   = 0, // NEW
-	}
-
-	for i := 0; i < len(args); i += 1 {
-		a := args[i]
-
-		if is_flag(a) {
-			switch a {
-			case "--window":
-				if i + 1 >= len(args) {return opts, false}
-				v, ok := parse_i64(args[i + 1]); if !ok {return opts, false}
-				opts.window = int(v); i += 1
-			case "--step":
-				if i + 1 >= len(args) {return opts, false}
-				v, ok := parse_i64(args[i + 1]); if !ok {return opts, false}
-				opts.step = int(v); i += 1
-			case "--m":
-				if i + 1 >= len(args) {return opts, false}
-				v, ok := parse_i64(args[i + 1]); if !ok {return opts, false}
-				opts.m = int(v); i += 1
-			case "--threads":
-				if i + 1 >= len(args) {return opts, false}
-				v, ok := parse_i64(args[i + 1]); if !ok {return opts, false}
-				opts.threads = int(v); i += 1
-			case "--out":
-				if i + 1 >= len(args) {return opts, false}
-				opts.out_path = args[i + 1]; i += 1
-			case "--quiet":
-				opts.verbose = false
-			case "--sequential":
-				opts.parallel = false
-			case "--start":
-				// NEW
-				if i + 1 >= len(args) {return opts, false}
-				v, ok := parse_i64(args[i + 1]); if !ok {return opts, false}
-				opts.start_byte = int(v); i += 1
-			case "--end":
-				// NEW
-				if i + 1 >= len(args) {return opts, false}
-				v, ok := parse_i64(args[i + 1]); if !ok {return opts, false}
-				opts.end_byte = int(v); i += 1
-			case:
-				fmt.eprintln("Unknown flag:", a)
-				return opts, false
-			}
-		} else {
-			if opts.file_path == "" {
-				opts.file_path = a
-			} else {
-				fmt.eprintln("Unexpected argument:", a)
-				return opts, false
-			}
-		}
-	}
-
-	if opts.file_path == "" {
-		fmt.eprintln("Error: missing <file>")
-		return opts, false
-	}
-
-	// Stable output default
-	if opts.out_path == "" {
-		opts.out_path = fmt.tprintf("%s.albc", opts.file_path)
-	}
-
-	// For stable output in v1:
-	if opts.m != 1 && opts.m != 2 {
-		fmt.eprintln("Error: for stable output v1, use --m 1 or --m 2 (m>=3 uses map iteration).")
-		return opts, false
-	}
-
-	return opts, true
-}
-
-cmd_scan :: proc(args: []string) -> int {
-	opts, ok := parse_scan_opts(args)
-	if !ok {
-		print_usage()
-		return 2
-	}
-
-	mf, mf_ok := mmap_file(opts.file_path)
-	if !mf_ok {return 1}
-	defer munmap_file(&mf)
-
-	// NEW: Apply byte range if specified
-	data_slice := mf.data
-	if opts.start_byte > 0 || opts.end_byte > 0 {
-		start := opts.start_byte
-		end := opts.end_byte
-
-		// Validate range
-		if start < 0 {start = 0}
-		if end <= 0 || end > len(mf.data) {end = len(mf.data)}
-		if start >= end {
-			fmt.eprintln("Error: invalid byte range: start >= end")
-			return 1
-		}
-
-		data_slice = mf.data[start:end]
-
-		if opts.verbose {
-			fmt.printfln("Scanning byte range: [%d..%d) (%d bytes)", start, end, len(data_slice))
-		}
-	}
-
-	res: Barcode_Result
-	if opts.parallel {
-		res = calculate_entropic_barcode_parallel(
-			data_slice, // Changed from mf.data
-			window_size_bytes = opts.window,
-			step_size_bytes = opts.step,
-			m = opts.m,
-			num_threads = opts.threads,
-			verbose = opts.verbose,
-		)
-	} else {
-		res = calculate_entropic_barcode(
-			data_slice, // Changed from mf.data
-			window_size_bytes = opts.window,
-			step_size_bytes = opts.step,
-			m = opts.m,
-			verbose = opts.verbose,
-		)
-	}
-	defer destroy_barcode(&res)
-
-	if len(res.quant) == 0 {
-		fmt.eprintln("Error: no windows produced (file too small for window_size?)")
-		return 1
-	}
-
-	// Write stable barcode file
-	write_ok := write_barcode_file(opts.out_path, res.metadata, res.quant)
-	if !write_ok {return 1}
-
-	// Print summary + root
-	root := compute_barcode_root(res.quant)
-
-	fmt.printfln("OK: wrote %d windows to %s", len(res.quant), opts.out_path)
-	fmt.printfln(
-		"Params: WS=%d SS=%d m=%d quant=%v",
-		res.metadata.window_size_bytes,
-		res.metadata.step_size_bytes,
-		res.metadata.m_block_size,
-		res.metadata.quantization,
-	)
-	fmt.printfln("Barcode root (fnv64a): %016x", root)
-
-	return 0
-}
-
-// ============================================================================
-// DIFF COMMAND - Compare two barcode files
-// ============================================================================
-
-cmd_diff :: proc(args: []string) -> int {
-	if len(args) < 2 {
-		fmt.eprintln("Usage: entropy diff <file1.albc> <file2.albc> [options]")
-		fmt.eprintln("")
-		fmt.eprintln("Options:")
-		fmt.eprintln("  --json       Output results as JSON")
-		fmt.eprintln("  --threshold <f64>  Only report differences > threshold (default: 0)")
-		return 2
-	}
-
-	file1_path := args[0]
-	file2_path := args[1]
-
-	json_output := false
-	threshold: f64 = 0.0
-
-	// Parse options
-	i := 2
-	for i < len(args) {
-		arg := args[i]
-		if arg == "--json" {
-			json_output = true
-			i += 1
-		} else if arg == "--threshold" && i + 1 < len(args) {
-			val, ok := parse_i64(args[i + 1])
-			if ok {
-				threshold = f64(val)
-			}
-			i += 2
-		} else {
-			fmt.eprintln("Unknown option:", arg)
-			return 2
-		}
-	}
-
-	// Read both barcode files
-	bf1, ok1 := read_barcode_file(file1_path)
-	if !ok1 {
-		return 1
-	}
-	defer destroy_barcode_file(&bf1)
-
-	bf2, ok2 := read_barcode_file(file2_path)
-	if !ok2 {
-		return 1
-	}
-	defer destroy_barcode_file(&bf2)
-
-	// Check compatibility
-	if bf1.meta.window_size_bytes != bf2.meta.window_size_bytes {
-		fmt.eprintln("Error: Incompatible window sizes")
-		fmt.eprintln("  File 1:", bf1.meta.window_size_bytes)
-		fmt.eprintln("  File 2:", bf2.meta.window_size_bytes)
-		return 1
-	}
-
-	if bf1.meta.step_size_bytes != bf2.meta.step_size_bytes {
-		fmt.eprintln("Error: Incompatible step sizes")
-		fmt.eprintln("  File 1:", bf1.meta.step_size_bytes)
-		fmt.eprintln("  File 2:", bf2.meta.step_size_bytes)
-		return 1
-	}
-
-	if bf1.meta.m_block_size != bf2.meta.m_block_size {
-		fmt.eprintln("Error: Incompatible m block sizes")
-		fmt.eprintln("  File 1:", bf1.meta.m_block_size)
-		fmt.eprintln("  File 2:", bf2.meta.m_block_size)
-		return 1
-	}
-
-	// Compare payloads
-	n := min(len(bf1.quant), len(bf2.quant))
-	if n == 0 {
-		fmt.eprintln("Error: One or both barcodes are empty")
-		return 1
-	}
-
-	total_diff: f64 = 0
-	max_diff: f64 = 0
-	max_diff_idx: int = 0
-	sum_sq: f64 = 0
-	num_above_threshold: int = 0
-
-	for i := 0; i < n; i += 1 {
-		val1 := f64(bf1.quant[i])
-		val2 := f64(bf2.quant[i])
-		d := math.abs(val1 - val2)
-
-		total_diff += d
-		sum_sq += d * d
-
-		if d > max_diff {
-			max_diff = d
-			max_diff_idx = i
-		}
-
-		if d > threshold {
-			num_above_threshold += 1
-		}
-	}
-
-	avg := total_diff / f64(n)
-	rms := math.sqrt(sum_sq / f64(n))
-
-	// Normalize to [0, 1] range (quantized values are 0-255)
-	avg_normalized := avg / 255.0
-	rms_normalized := rms / 255.0
-	max_normalized := max_diff / 255.0
-
-	if json_output {
-		// JSON output for scripting
-		fmt.println("{")
-		fmt.printf("  \"file1\": \"%s\",\n", file1_path)
-		fmt.printf("  \"file2\": \"%s\",\n", file2_path)
-		fmt.printf("  \"windows_compared\": %d,\n", n)
-		fmt.printf("  \"avg_delta_raw\": %.4f,\n", avg)
-		fmt.printf("  \"avg_delta_normalized\": %.6f,\n", avg_normalized)
-		fmt.printf("  \"rms_delta_raw\": %.4f,\n", rms)
-		fmt.printf("  \"rms_delta_normalized\": %.6f,\n", rms_normalized)
-		fmt.printf("  \"max_delta_raw\": %.4f,\n", max_diff)
-		fmt.printf("  \"max_delta_normalized\": %.6f,\n", max_normalized)
-		fmt.printf("  \"max_delta_window\": %d,\n", max_diff_idx)
-		fmt.printf("  \"windows_above_threshold\": %d,\n", num_above_threshold)
-		fmt.printf("  \"threshold\": %.4f\n", threshold)
-		fmt.println("}")
-	} else {
-		// Human-readable output
-		fmt.println("\n=== Barcode Comparison ===")
-		fmt.println("")
-		fmt.println("File 1:", file1_path)
-		fmt.println("File 2:", file2_path)
-		fmt.println("")
-		fmt.printf("Windows compared:  %d\n", n)
-		fmt.println("")
-		fmt.printf("Average ΔQ:        %.4f  (%.2f%% of range)\n", avg, avg_normalized * 100)
-		fmt.printf("RMS ΔQ:            %.4f  (%.2f%% of range)\n", rms, rms_normalized * 100)
-		fmt.printf(
-			"Max ΔQ:            %.4f  (%.2f%% of range) at window %d\n",
-			max_diff,
-			max_normalized * 100,
-			max_diff_idx,
-		)
-
-		if threshold > 0 {
-			fmt.println("")
-			fmt.printf(
-				"Windows > threshold: %d (%.2f%%)\n",
-				num_above_threshold,
-				f64(num_above_threshold) / f64(n) * 100,
-			)
-		}
-		fmt.println("")
-	}
-
-	return 0
-}
-
-print_usage :: proc() {
-	fmt.println("Aletheia Entropy Scanner")
-	fmt.println("")
-	fmt.println("Usage:")
-	fmt.println(
-		"  entropy scan <file> --window <bytes> --step <bytes> --m <1|2> --out <barcode.albc> [options]",
-	)
-	fmt.println("  entropy diff <file1.albc> <file2.albc> [options]")
-	fmt.println("")
-	fmt.println("Scan options:")
-	fmt.println("  --threads N       Number of threads (0 = auto)")
-	fmt.println("  --quiet           Suppress verbose output")
-	fmt.println("  --sequential      Disable parallel processing")
-	fmt.println("  --start <byte>    Start scanning from byte offset (zoom scan)")
-	fmt.println("  --end <byte>      End scanning at byte offset (zoom scan)")
-	fmt.println("")
-	fmt.println("Diff options:")
-	fmt.println("  --json            Output results as JSON")
-	fmt.println("  --threshold <f64> Only report differences > threshold (default: 0)")
+	return ok
 }
 
 // ============================================================================
@@ -1266,30 +884,169 @@ print_usage :: proc() {
 // ============================================================================
 
 main :: proc() {
+	// Default values
+	window_size_bytes := 64 * 1024
+	step_size_bytes := 16 * 1024
+	m := 1
+	num_threads := 0
+	verbose := true
+	output_path := ""
+	format_version := 1
+	input_file := ""
+
+	// Parse arguments
 	args := os.args[1:]
+	i := 0
+	for i < len(args) {
+		arg := args[i]
 
-	if len(args) == 0 {
-		print_usage()
-		os.exit(2)
+		switch arg {
+		case "--help", "-h":
+			fmt.println("Usage: entropy [options] <input_file>")
+			fmt.println("Options:")
+			fmt.println("  --window <size>    Set window size (default: 64KB)")
+			fmt.println("  --step <size>      Set step size (default: 16KB)")
+			fmt.println("  --m <value>        Set m value (1, 2, 3, or 4; default: 1)")
+			fmt.println("  --threads <count>  Set number of threads (default: auto)")
+			fmt.println("  --output <file>    Set output file path")
+			fmt.println("  --format <version> Set format version (1 or 2; default: 1)")
+			fmt.println("  --quiet, -q        Suppress output")
+			fmt.println("  --verbose, -v      Enable verbose output")
+			fmt.println("  --help, -h         Show this help message")
+			os.exit(0)
+		case "--window":
+			if i + 1 < len(args) {
+				if val, ok := strconv.parse_int(args[i + 1]); ok {
+					window_size_bytes = val
+				}
+				i += 1
+			}
+		case "--step":
+			if i + 1 < len(args) {
+				if val, ok := strconv.parse_int(args[i + 1]); ok {
+					step_size_bytes = val
+				}
+				i += 1
+			}
+		case "--m":
+			if i + 1 < len(args) {
+				if val, ok := strconv.parse_int(args[i + 1]); ok {
+					m = val
+					if m < 1 || m > 4 {
+						fmt.eprintln("Error: m must be between 1 and 4")
+						os.exit(1)
+					}
+				}
+				i += 1
+			}
+		case "--threads":
+			if i + 1 < len(args) {
+				if val, ok := strconv.parse_int(args[i + 1]); ok {
+					num_threads = val
+				}
+				i += 1
+			}
+		case "--output":
+			if i + 1 < len(args) {
+				output_path = args[i + 1]
+				i += 1
+			}
+		case "--format", "-f":
+			if i + 1 < len(args) {
+				if val, ok := strconv.parse_int(args[i + 1]); ok {
+					format_version = val
+					if format_version < 1 || format_version > 2 {
+						fmt.eprintln("Error: --format must be 1 or 2")
+						os.exit(1)
+					}
+				}
+				i += 1
+			}
+		case "--quiet", "-q":
+			verbose = false
+		case "--verbose", "-v":
+			verbose = true
+		case:
+			// Non-option argument = input file
+			// Accept any argument that doesn't start with '-' as input file
+			if len(arg) > 0 && arg[0] != '-' {
+				input_file = arg
+			} else if len(arg) > 0 {
+				fmt.eprintfln("Error: Unknown option: %s", arg)
+				os.exit(2)
+			}
+		}
+
+		i += 1
 	}
 
-	cmd := args[0]
-	cmd_args := args[1:]
-
-	exit_code: int
-	switch cmd {
-	case "scan":
-		exit_code = cmd_scan(cmd_args)
-	case "diff":
-		exit_code = cmd_diff(cmd_args)
-	case "help", "--help", "-h":
-		print_usage()
-		exit_code = 0
-	case:
-		fmt.eprintln("Unknown command:", cmd)
-		print_usage()
-		exit_code = 2
+	// Check for input file
+	if input_file == "" {
+		fmt.eprintln("Error: No input file specified")
+		fmt.eprintln("Usage: entropy [options] <input_file>")
+		os.exit(1)
 	}
 
-	os.exit(exit_code)
+	// Default output path if not specified
+	if output_path == "" {
+		output_path = fmt.tprintf("%s.albc", input_file)
+	}
+
+	// Print settings
+	if verbose {
+		fmt.printfln("Input file: %s", input_file)
+		fmt.printfln("Window size: %d bytes", window_size_bytes)
+		fmt.printfln("Step size: %d bytes", step_size_bytes)
+		fmt.printfln("m value: %d", m)
+		fmt.printfln("Threads: %s", num_threads == 0 ? "auto" : fmt.tprintf("%d", num_threads))
+		fmt.printfln("Output file: %s", output_path)
+		fmt.printfln("Format version: %d", format_version)
+	}
+
+	// Memory-map the input file
+	mf, ok := mmap_file(input_file)
+	if !ok {
+		fmt.eprintln("Error: Could not memory-map input file")
+		os.exit(1)
+	}
+	defer munmap_file(&mf)
+
+	// Check if input is already a barcode file
+	if starts_with_magic(mf.data) {
+		fmt.eprintln("Error: Input file appears to be an ALBC barcode file")
+		os.exit(1)
+	}
+
+	// Compute the entropic barcode
+	barcode_result := calculate_entropic_barcode_parallel(
+		mf.data,
+		window_size_bytes,
+		step_size_bytes,
+		m,
+		num_threads,
+		verbose,
+	)
+	defer destroy_barcode(&barcode_result)
+
+	// Write output based on format version
+	if format_version == 2 {
+		ok = write_barcode_file_v2(
+			output_path,
+			barcode_result.metadata,
+			barcode_result.quant,
+			barcode_result.raw,
+		)
+		if verbose && ok {
+			fmt.println("Wrote ALBC v2 (quantized + raw f64)")
+		}
+	} else {
+		ok = write_barcode_file(output_path, barcode_result.metadata, barcode_result.quant)
+		if verbose && ok {
+			fmt.println("Wrote ALBC v1 (quantized only)")
+		}
+	}
+
+	if !ok {
+		os.exit(1)
+	}
 }

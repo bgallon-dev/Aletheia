@@ -42,15 +42,32 @@ except ImportError:
 class ALBCParser:
     """Parser for ALBC (Aletheia Barcode) binary format."""
 
-    MAGIC = b"ALBC0001"
-    HEADER_SIZE = 32
+    MAGIC_V1 = b"ALBC0001"
+    MAGIC_V2 = b"ALBC0002"
+    HEADER_SIZE_V1 = 32
+    HEADER_SIZE_V2 = 40  # Adds raw_data_offset field
+
+    @staticmethod
+    def detect_version(data: bytes) -> Optional[int]:
+        """Detect ALBC format version from magic bytes."""
+        if len(data) < 8:
+            return None
+        magic = data[0:8]
+        if magic == ALBCParser.MAGIC_V1:
+            return 1
+        elif magic == ALBCParser.MAGIC_V2:
+            return 2
+        return None
 
     @staticmethod
     def parse_header(albc_data: bytes) -> Optional[Dict[str, Any]]:
         """
-        Parse ALBC header from binary data.
+        Parse ALBC header from binary data (version-aware).
 
-        Header layout (little-endian):
+        Only validates header bytes are present - does NOT validate payload length.
+        Use parse_full() when you need payload validation.
+
+        Header layout v1 (little-endian, 32 bytes):
           0..7   : magic "ALBC0001" (8 bytes)
           8..11  : window_size_bytes u32
           12..15 : step_size_bytes   u32
@@ -58,80 +75,178 @@ class ALBCParser:
           20..23 : quant_version     u32
           24..31 : barcode_len       u64
           32..   : quantized barcode bytes
+
+        Header layout v2 (little-endian, 40 bytes):
+          0..31  : same as v1
+          32..39 : raw_data_offset   u64 (0 if no raw data)
+          40..   : quantized barcode bytes
+          ???..  : raw f64 array (at raw_data_offset, if non-zero)
         """
-        if len(albc_data) < ALBCParser.HEADER_SIZE:
+        version = ALBCParser.detect_version(albc_data)
+        if version is None:
             return None
 
-        magic = albc_data[0:8]
-        if magic != ALBCParser.MAGIC:
+        header_size = (
+            ALBCParser.HEADER_SIZE_V1 if version == 1 else ALBCParser.HEADER_SIZE_V2
+        )
+
+        # Only check we have enough bytes for the HEADER
+        if len(albc_data) < header_size:
             return None
 
-        # Unpack header fields (little-endian)
+        # Parse header fields
         window_size_bytes = struct.unpack("<I", albc_data[8:12])[0]
         step_size_bytes = struct.unpack("<I", albc_data[12:16])[0]
         m_block_size = struct.unpack("<I", albc_data[16:20])[0]
         quant_version = struct.unpack("<I", albc_data[20:24])[0]
         barcode_len = struct.unpack("<Q", albc_data[24:32])[0]
 
-        # Validate
-        expected_size = ALBCParser.HEADER_SIZE + barcode_len
-        if len(albc_data) != expected_size:
-            return None
-
-        return {
+        result = {
+            "format_version": version,
+            "header_size": header_size,  # Useful for callers
             "window_size_bytes": window_size_bytes,
             "step_size_bytes": step_size_bytes,
             "m_block_size": m_block_size,
             "quant_version": f"v{quant_version}",
             "barcode_len": barcode_len,
+            "raw_data_offset": 0,
         }
+
+        if version == 2:
+            result["raw_data_offset"] = struct.unpack("<Q", albc_data[32:40])[0]
+
+        # NO payload length validation here - that's parse_full's job
+        return result
+
+    @staticmethod
+    def get_header_size(version: int) -> int:
+        """Get header size for a specific format version."""
+        return ALBCParser.HEADER_SIZE_V1 if version == 1 else ALBCParser.HEADER_SIZE_V2
+
+    @staticmethod
+    def parse_full(albc_data: bytes) -> Optional[Dict[str, Any]]:
+        """
+        Parse ALBC header AND payload. Validates total file length.
+
+        Returns None if file is truncated or malformed.
+        """
+        header = ALBCParser.parse_header(albc_data)
+        if header is None:
+            return None
+
+        header_size = header["header_size"]
+        barcode_len = header["barcode_len"]
+
+        # Validate we have enough data for the payload
+        required_size = header_size + barcode_len
+        if len(albc_data) < required_size:
+            return None  # Truncated file
+
+        payload = albc_data[header_size : header_size + barcode_len]
+
+        # Belt-and-suspenders: verify slice returned expected length
+        # (This should always pass given the check above, but makes intent explicit)
+        assert len(payload) == barcode_len, "Slice length mismatch"
+
+        return {**header, "barcode_payload": payload}
+
+    @staticmethod
+    def parse_full_with_raw(albc_data: bytes) -> Optional[Dict[str, Any]]:
+        """
+        Parse ALBC including raw f64 data (v2 only).
+
+        Returns dict with 'barcode_payload' (bytes) and optionally 'raw_entropy' (list of floats).
+        """
+        result = ALBCParser.parse_full(albc_data)
+        if result is None:
+            return None
+
+        raw_offset = result.get("raw_data_offset", 0)
+        if raw_offset > 0 and result["format_version"] == 2:
+            barcode_len = result["barcode_len"]
+            raw_bytes = albc_data[raw_offset : raw_offset + barcode_len * 8]
+            # Unpack as little-endian f64 array
+            result["raw_entropy"] = list(struct.unpack(f"<{barcode_len}d", raw_bytes))
+
+        return result
 
     @staticmethod
     def parse_header_from_file(file_path: Path) -> Optional[Dict[str, Any]]:
         """
         Parse ALBC header directly from file (without loading entire file).
 
-        Only reads the 32-byte header, leaving the rest on disk.
+        Reads up to 40 bytes (max header size for v2), detects version,
+        and parses accordingly.
+
+        Does NOT validate that file length matches barcode_len (use parse_from_file for that).
         """
+        # Read enough bytes for the largest header (v2 = 40 bytes)
+        max_header_size = ALBCParser.HEADER_SIZE_V2
+
         with open(file_path, "rb") as f:
-            header_bytes = f.read(ALBCParser.HEADER_SIZE)
-            if len(header_bytes) < ALBCParser.HEADER_SIZE:
-                return None
+            header_bytes = f.read(max_header_size)
 
-            return ALBCParser.parse_header(header_bytes)
-
-    @staticmethod
-    def parse_full(albc_data: bytes) -> Optional[Dict[str, Any]]:
-        """
-        Parse ALBC from bytes (for small barcodes or when already in memory).
-
-        For large barcodes, consider using parse_from_file() instead.
-        """
-        header = ALBCParser.parse_header(albc_data)
-        if header is None:
-            return None
-
-        payload = albc_data[ALBCParser.HEADER_SIZE :]
-
-        return {**header, "barcode_payload": payload}
+        # Delegate to parse_header which handles version detection
+        return ALBCParser.parse_header(header_bytes)
 
     @staticmethod
     def parse_from_file(file_path: Path) -> Optional[Dict[str, Any]]:
         """
         Parse ALBC directly from file (memory-efficient for large barcodes).
 
-        Loads entire payload into memory. For extremely large barcodes,
-        consider adding a streaming comparison API.
+        Returns None if file is missing, has invalid header, or is truncated.
         """
         header = ALBCParser.parse_header_from_file(file_path)
         if header is None:
             return None
 
+        # Use the header_size from parsed header (version-aware)
+        header_size = header["header_size"]
+        expected_len = header["barcode_len"]
+
         with open(file_path, "rb") as f:
-            f.seek(ALBCParser.HEADER_SIZE)
-            payload = f.read()
+            f.seek(header_size)
+            # FIX: Read exactly barcode_len bytes, not to EOF
+            # This is critical for v2 format which appends raw f64 data after quant payload
+            payload = f.read(expected_len)
+
+        # Validate payload length matches header claim
+        actual_len = len(payload)
+        if actual_len != expected_len:
+            # Could log: f"ALBC truncated: expected {expected_len} bytes, got {actual_len}"
+            return None
 
         return {**header, "barcode_payload": payload}
+
+    @staticmethod
+    def parse_from_file_with_raw(file_path: Path) -> Optional[Dict[str, Any]]:
+        """
+        Parse ALBC from file including raw f64 data (v2 only).
+
+        Memory-efficient: reads quant and raw sections separately without loading entire file.
+
+        Returns dict with 'barcode_payload' (bytes) and optionally 'raw_entropy' (list of floats).
+        """
+        result = ALBCParser.parse_from_file(file_path)
+        if result is None:
+            return None
+
+        raw_offset = result.get("raw_data_offset", 0)
+        if raw_offset > 0 and result["format_version"] == 2:
+            barcode_len = result["barcode_len"]
+            raw_size = barcode_len * 8  # 8 bytes per f64
+
+            with open(file_path, "rb") as f:
+                f.seek(raw_offset)
+                raw_bytes = f.read(raw_size)
+
+            if len(raw_bytes) == raw_size:
+                # Unpack as little-endian f64 array
+                result["raw_entropy"] = list(
+                    struct.unpack(f"<{barcode_len}d", raw_bytes)
+                )
+
+        return result
 
     @staticmethod
     def compare_barcodes(
@@ -303,21 +418,23 @@ class OdinScanner:
         m: int = 1,
         threads: int = 0,
         verbose: bool = True,
-        start_byte: int = 0,  # NEW: byte range start
-        end_byte: int = 0,  # NEW: byte range end (0 = scan to end)
+        start_byte: int = 0,
+        end_byte: int = 0,
+        output_format: int = 1,  # NEW: ALBC format version (1 or 2)
     ) -> Tuple[bytes, str]:
         """
         Run Odin scanner on file.
 
         Args:
             file_path: Path to file to scan
-            window_size: Window size in bytes
-            step_size: Step size in bytes
-            m: Block size for entropy calculation
-            threads: Number of threads (0 = auto)
-            verbose: Print verbose output
-            start_byte: Starting byte offset for range scan (0 = from beginning)
-            end_byte: Ending byte offset for range scan (0 = to end of file)
+            window_size: Sliding window size in bytes
+            step_size: Step size between windows
+            m: Block size for entropy calculation (1=bytes, 2=pairs, etc.)
+            threads: Number of threads (0=auto)
+            verbose: Print progress info
+            start_byte: Start offset for partial scan (0=beginning)
+            end_byte: End offset for partial scan (0=end of file)
+            output_format: ALBC output format version (1=quantized, 2=quantized+raw)
 
         Returns:
             (albc_bytes, temp_path): The barcode data and temporary file path
@@ -327,29 +444,35 @@ class OdinScanner:
 
         cmd = [
             self.odin_binary,
-            "scan",
-            file_path,
+            file_path,  # Input file comes right after binary (no "scan" subcommand)
             "--window",
             str(window_size),
             "--step",
             str(step_size),
             "--m",
             str(m),
-            "--out",
+            "--output",
             tmp_path,
         ]
 
         if threads > 0:
             cmd.extend(["--threads", str(threads)])
 
+        if start_byte > 0:
+            cmd.extend(["--start", str(start_byte)])
+
+        if end_byte > 0:
+            cmd.extend(["--end", str(end_byte)])
+
+        # NEW: Add format version flag for v2+
+        if output_format >= 2:
+            cmd.extend(["--format", str(output_format)])
+
         if not verbose:
             cmd.append("--quiet")
 
-        # NEW: Add byte range parameters
-        if start_byte > 0:
-            cmd.extend(["--start", str(start_byte)])
-        if end_byte > 0:
-            cmd.extend(["--end", str(end_byte)])
+        if verbose:
+            print(f"  Running: {' '.join(cmd)}")
 
         try:
             result = subprocess.run(cmd, capture_output=True, text=True, check=True)
@@ -447,6 +570,14 @@ class IngestPipeline:
             except Exception:
                 pass  # Identity system not configured, signing disabled
 
+    def _load_defaults(self) -> Dict[str, Any]:
+        """Load default scan parameters from config.json."""
+        if self.repo.config_path.exists():
+            with open(self.repo.config_path, "r") as f:
+                config = json.load(f)
+                return config.get("defaults", {})
+        return {}
+
     def ingest(
         self,
         file_path: str,
@@ -456,21 +587,27 @@ class IngestPipeline:
         threads: int = 0,
         verbose: bool = True,
         keep_temp: bool = False,
-        sign_with: Optional[str] = None,  # NEW: key_id to sign with
-        passphrase: Optional[str] = None,  # NEW: passphrase for encrypted key
+        sign_with: Optional[str] = None,
+        passphrase: Optional[str] = None,
+        output_format: int = 1,  # NEW: ALBC format version
     ) -> str:
-        """Complete ingest workflow (streaming, handles arbitrary file sizes).
+        """
+        Ingest a file into the repository.
 
         Args:
-            file_path: Path to file to scan
-            window_size: Window size in bytes
-            step_size: Step size in bytes
+            file_path: Path to file to ingest
+            window_size: Sliding window size
+            step_size: Step size between windows
             m: Block size for entropy calculation
-            threads: Number of threads (0 = auto)
-            verbose: Print verbose output
-            keep_temp: Keep temporary .albc file
-            sign_with: Key ID to sign the artifact record with (optional)
-            passphrase: Passphrase for encrypted signing key (optional)
+            threads: Number of threads (0=auto)
+            verbose: Print progress info
+            keep_temp: Keep temporary files after ingest
+            sign_with: Optional key_id to sign the artifact record
+            passphrase: Passphrase for signing key
+            output_format: ALBC format version (1 or 2)
+
+        Returns:
+            artifact_id: The unique identifier for this artifact
         """
         file_path_obj = Path(file_path)
 
@@ -486,7 +623,13 @@ class IngestPipeline:
                 f"[1/7] Running Odin scanner (window={window_size}, step={step_size}, m={m})..."
             )
         albc_bytes, temp_albc_path = self.scanner.scan(
-            file_path, window_size, step_size, m, threads, verbose=False
+            file_path,
+            window_size=window_size,
+            step_size=step_size,
+            m=m,
+            threads=threads,
+            verbose=verbose,
+            output_format=output_format,  # NEW: Pass format version
         )
 
         try:
@@ -538,15 +681,29 @@ class IngestPipeline:
                 print("[5/7] Storing barcode object...")
             self.repo.store_object(albc_bytes, "barcode")
 
-            # Step 6: Parse ALBC header (only reads 32 bytes)
+            # Step 6: Parse ALBC header (only reads 32-40 bytes depending on version)
             if verbose:
                 print("[6/7] Parsing barcode header...")
-            scan_params = self.parser.parse_header(albc_bytes)
-            if scan_params is None:
+            header = self.parser.parse_header(albc_bytes)
+            if header is None:
                 raise ValueError("Failed to parse ALBC header")
 
+            # Build scan_params with canonical _bytes key names
+            scan_params = {
+                "window_size_bytes": header["window_size_bytes"],
+                "step_size_bytes": header["step_size_bytes"],
+                "m_block_size": header["m_block_size"],
+                "quant_version": header["quant_version"],
+                "barcode_len": header["barcode_len"],
+                "format_version": header.get("format_version", 1),
+                "raw_data_offset": header.get("raw_data_offset", 0),
+            }
+
             if verbose:
-                print(f"  Scan params: {scan_params}")
+                print(
+                    f"  Scan params: WS={scan_params['window_size_bytes']}, SS={scan_params['step_size_bytes']}, m={scan_params['m_block_size']}"
+                )
+                print(f"  Format version: ALBC000{scan_params['format_version']}")
 
             # Step 7: Build and store artifact record
             if verbose:
@@ -609,24 +766,23 @@ class IngestPipeline:
                     pass
 
 
+# Update main() CLI argument parsing:
+
+
 def main():
     """CLI entry point for repo ingest."""
     if len(sys.argv) < 2:
-        print("Usage: python ingest.py <file> [options]", file=sys.stderr)
-        print("\nOptions:", file=sys.stderr)
-        print("  --window <bytes>     Window size (default: 65536)", file=sys.stderr)
-        print("  --step <bytes>       Step size (default: 16384)", file=sys.stderr)
-        print("  --m <1|2>            Block size (default: 1)", file=sys.stderr)
-        print("  --threads <N>        Thread count (default: auto)", file=sys.stderr)
-        print("  --repo <path>        Repository root (default: .)", file=sys.stderr)
-        print(
-            "  --no-auto-init       Don't auto-initialize repository", file=sys.stderr
-        )
-        print("  --quiet              Suppress output", file=sys.stderr)
-        print("  --keep-temp          Keep temporary .albc file", file=sys.stderr)
-        sys.exit(2)
+        print("Usage: python ingest.py <file> [options]")
+        print("Options:")
+        print("  --window <size>    Window size (default: 65536)")
+        print("  --step <size>      Step size (default: 16384)")
+        print("  --m <size>         Block size (default: 1)")
+        print("  --threads <n>      Thread count (default: auto)")
+        print("  --format <version> ALBC format version: 1 or 2 (default: 1)")
+        print("  --repo <path>      Repository root (default: .)")
+        print("  --quiet            Suppress output")
+        sys.exit(1)
 
-    # Parse arguments (simple implementation)
     file_path = sys.argv[1]
 
     kwargs = {
@@ -636,6 +792,7 @@ def main():
         "threads": 0,
         "verbose": True,
         "keep_temp": False,
+        "output_format": 1,  # NEW: Default to v1
     }
     repo_root = "."
     auto_init = True
@@ -643,6 +800,7 @@ def main():
     i = 2
     while i < len(sys.argv):
         arg = sys.argv[i]
+
         if arg == "--window" and i + 1 < len(sys.argv):
             kwargs["window_size"] = int(sys.argv[i + 1])
             i += 2
@@ -655,21 +813,23 @@ def main():
         elif arg == "--threads" and i + 1 < len(sys.argv):
             kwargs["threads"] = int(sys.argv[i + 1])
             i += 2
+        elif arg == "--format" and i + 1 < len(sys.argv):  # NEW
+            kwargs["output_format"] = int(sys.argv[i + 1])
+            i += 2
         elif arg == "--repo" and i + 1 < len(sys.argv):
             repo_root = sys.argv[i + 1]
             i += 2
-        elif arg == "--no-auto-init":
-            auto_init = False
-            i += 1
         elif arg == "--quiet":
             kwargs["verbose"] = False
             i += 1
         elif arg == "--keep-temp":
             kwargs["keep_temp"] = True
             i += 1
+        elif arg == "--no-init":
+            auto_init = False
+            i += 1
         else:
-            print(f"Unknown argument: {arg}", file=sys.stderr)
-            sys.exit(2)
+            i += 1
 
     try:
         pipeline = IngestPipeline(repo_root=repo_root, auto_init=auto_init)
