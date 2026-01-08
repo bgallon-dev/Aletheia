@@ -250,7 +250,7 @@ class ArtifactRecordBuilder:
 class OdinScanner:
     """Interface to Odin entropy scanner."""
     
-    def __init__(self, odin_binary: str = None):
+    def __init__(self, odin_binary: Optional[str] = None):
         """
         Initialize scanner.
         
@@ -441,7 +441,7 @@ class OdinScanner:
 class IngestPipeline:
     """Complete ingest pipeline for Aletheia repository."""
     
-    def __init__(self, repo_root: str = ".", odin_binary: str = None, auto_init: bool = True):
+    def __init__(self, repo_root: str = ".", odin_binary: Optional[str] = None, auto_init: bool = True):
         """
         Initialize ingest pipeline.
         
