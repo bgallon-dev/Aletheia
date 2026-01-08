@@ -31,6 +31,13 @@ ZOOM_WINDOW_SIZE = 8192  # 8 KiB
 ZOOM_STEP_SIZE = 2048  # 2 KiB
 ZOOM_MARGIN_WINDOWS = 2  # Include 2 windows before/after for context
 
+try:
+    from identity import IdentityLink, SignatureInvalidError
+
+    IDENTITY_AVAILABLE = True
+except ImportError:
+    IDENTITY_AVAILABLE = False
+
 
 class ZoomRegion:
     """Represents a region requiring zoom scan."""
@@ -81,14 +88,34 @@ class VerificationResult:
         self.zoom_performed = False
         self.zoom_regions: List[ZoomRegion] = []
 
+        # NEW: Signature verification results
+        self.signature_present = False
+        self.signature_valid = False
+        self.signature_key_id: Optional[str] = None
+        self.signature_fingerprint: Optional[str] = None
+        self.signature_signed_at: Optional[str] = None
+        self.signature_error: Optional[str] = None
+
     def passed(self) -> bool:
         """Check if verification passed."""
         if self.error:
             return False
         if self.forensic_skipped:
-            # If forensic check is skipped, only cryptographic check matters
             return self.cryptographic_match
+        # Note: Signature check is informational, not required for pass
         return self.cryptographic_match and self.forensic_match
+
+    @staticmethod
+    def _format_bytes(byte_count: int) -> str:
+        """Format byte count in human-readable form."""
+        if byte_count < 1024:
+            return f"{byte_count} bytes"
+        elif byte_count < 1024 * 1024:
+            return f"{byte_count / 1024:.2f} KB"
+        elif byte_count < 1024 * 1024 * 1024:
+            return f"{byte_count / (1024 * 1024):.2f} MB"
+        else:
+            return f"{byte_count / (1024 * 1024 * 1024):.2f} GB"
 
     def format_report(self, verbose: bool = True) -> str:
         """Format verification report."""
@@ -201,17 +228,23 @@ class VerificationResult:
                         f"    No fine-grained differences (coarse mismatch may be quantization artifact)"
                     )
 
-        return "\n".join(lines)
-
-    @staticmethod
-    def _format_bytes(byte_count: int) -> str:
-        """Format byte count in human-readable form."""
-        if byte_count < 1024:
-            return f"{byte_count} bytes"
-        elif byte_count < 1024 * 1024:
-            return f"{byte_count / 1024:.1f} KB"
+        # NEW: Signature verification section
+        if self.signature_present:
+            lines.append("\n[3/3] Identity Link (Signature)")
+            if self.signature_valid:
+                lines.append("  ✓ Signature valid")
+                lines.append(f"    Signed by:   {self.signature_key_id}")
+                lines.append(f"    Fingerprint: {self.signature_fingerprint}")
+                lines.append(f"    Signed at:   {self.signature_signed_at}")
+            else:
+                lines.append("  ✗ Signature INVALID")
+                if self.signature_error:
+                    lines.append(f"    Error: {self.signature_error}")
         else:
-            return f"{byte_count / (1024 * 1024):.1f} MB"
+            lines.append("\n[3/3] Identity Link (Signature)")
+            lines.append("  ⊘ No signature present")
+
+        return "\n".join(lines)
 
 
 class ArtifactVerifier:
@@ -227,6 +260,12 @@ class ArtifactVerifier:
 
         self.scanner = OdinScanner()
         self.parser = ALBCParser()
+        self.identity: Optional[IdentityLink] = None
+        if IDENTITY_AVAILABLE:
+            try:
+                self.identity = IdentityLink()
+            except Exception:
+                pass
 
     def verify(
         self,
@@ -234,8 +273,17 @@ class ArtifactVerifier:
         file_path: str,
         verbose: bool = True,
         enable_zoom: bool = True,
+        trusted_keys: Optional[Dict[str, str]] = None,  # NEW
     ) -> VerificationResult:
-        """Verify a file against a stored artifact record."""
+        """Verify a file against a stored artifact record.
+
+        Args:
+            artifact_id: The ID of the artifact to verify
+            file_path: The path to the file to verify
+            verbose: Enable verbose output
+            enable_zoom: Enable zoom scan for modified regions
+            trusted_keys: Optional dict of key_id -> public_key_b64 for signature verification
+        """
         result = VerificationResult()
 
         # Load artifact record
@@ -394,6 +442,35 @@ class ArtifactVerifier:
         except Exception as e:
             result.error = f"Barcode verification failed: {e}"
             return result
+
+        # NEW: Step 3 - Verify signature if present
+        identity_link = record.get("identity_link")
+        if identity_link:
+            result.signature_present = True
+
+            if verbose:
+                print("\n[3/3] Identity link verification...")
+
+            if self.identity:
+                sig_result = self.identity.verify_signature(
+                    record,
+                    identity_link,
+                    trusted_keys=trusted_keys,
+                )
+
+                result.signature_valid = sig_result["valid"]
+                result.signature_key_id = sig_result.get("key_id")
+                result.signature_fingerprint = sig_result.get("fingerprint")
+                result.signature_signed_at = sig_result.get("signed_at")
+                result.signature_error = sig_result.get("error")
+
+                if verbose:
+                    status = "✓ PASS" if result.signature_valid else "✗ FAIL"
+                    print(f"  {status}: Signature verification")
+            else:
+                result.signature_error = "Identity system not available"
+                if verbose:
+                    print("  ⚠ Cannot verify: Identity system not available")
 
         return result
 
