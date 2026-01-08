@@ -210,3 +210,14 @@ __marimo__/
 odin_entropy/entropy.exe
 entropy/odin_entropy/entropy.exe
 applsci-14-06297-v2.pdf
+
+
+\objects
+\records
+\tmp
+
+index.sqlite3
+config.json
+applsci_corrupt.pdf
+
+.gitignore
