@@ -221,3 +221,4 @@ config.json
 applsci_corrupt.pdf
 
 .gitignore
+alethaia_repo/ARCHITECTURE_ANALYSIS.md
