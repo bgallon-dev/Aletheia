@@ -1,0 +1,12 @@
+{
+  "version": "aletheia/repo/1",
+  "storage": {
+    "hash_algorithm": "sha256",
+    "object_fanout": 2
+  },
+  "immutability": {
+    "enforce": true,
+    "allow_overwrite": false
+  },
+  "created_at": null
+}
