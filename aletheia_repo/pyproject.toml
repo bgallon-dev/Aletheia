@@ -1,0 +1,19 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "aletheia"
+version = "0.1.0"
+description = "Content-addressed storage with forensic barcode verification"
+readme = "README.md"
+requires-python = ">=3.8"
+
+[project.optional-dependencies]
+crypto = ["cryptography>=41"]
+
+[project.scripts]
+aletheia = "aletheia.cli:main"
+
+[tool.setuptools.packages.find]
+include = ["aletheia*"]

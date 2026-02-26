@@ -8,9 +8,12 @@ import sqlite3
 import shutil
 import uuid
 import time
-import sys
+import re
 
-from utils import compute_file_hash, hash_and_copy_file, hash_bytes
+from .domain import ArtifactRecord, RepoConfig, SchemaValidationError
+from .utils import compute_file_hash, hash_and_copy_file, hash_bytes
+
+OBJECT_ID_RE = re.compile(r"^[0-9a-f]{64}$")
 
 
 class RepositoryError(Exception):
@@ -43,6 +46,12 @@ class IntegrityError(RepositoryError):
     pass
 
 
+class ImmutabilityError(RepositoryError):
+    """Raised when a write would violate repository immutability policy."""
+
+    pass
+
+
 class AletheiaRepository:
     """Content-addressed storage repository with SQLite indexing."""
 
@@ -61,12 +70,17 @@ class AletheiaRepository:
         self.tmp_dir = self.root / "tmp"
         self.config_path = self.root / "config.json"
         self.db_path = self.root / "index.sqlite3"
+        self.config = RepoConfig.default(created_at_unix_ms=None)
+        self.object_fanout = self.config.storage.object_fanout
 
         # Check or initialize repository structure
         if auto_init:
             self._ensure_initialized()
         else:
             self._verify_initialized()
+
+        self.config = self.load_config(set_created_at_if_missing=auto_init)
+        self.object_fanout = self.config.storage.object_fanout
 
     def _ensure_initialized(self) -> None:
         """Ensure repository structure exists, creating it if necessary."""
@@ -76,11 +90,7 @@ class AletheiaRepository:
 
         # Create config.json if it doesn't exist
         if not self.config_path.exists():
-            config = {
-                "version": "aletheia/repo/1",
-                "storage": {"hash_algorithm": "sha256", "object_fanout": 2},
-                "created_at": self._unix_ms(),
-            }
+            config = RepoConfig.default(created_at_unix_ms=self._unix_ms()).to_dict()
             self.config_path.write_text(json.dumps(config, indent=2))
 
         # Initialize database if needed
@@ -113,6 +123,39 @@ class AletheiaRepository:
                 "Database exists but schema is invalid. "
                 "Re-initialize with: AletheiaRepository(auto_init=True)"
             )
+
+    def load_config(self, set_created_at_if_missing: bool = False) -> RepoConfig:
+        """Load and validate repository config.json."""
+        try:
+            with open(self.config_path, "r") as f:
+                raw_config = json.load(f)
+        except FileNotFoundError as exc:
+            raise RepositoryNotInitializedError(
+                f"Repository config missing: {self.config_path}"
+            ) from exc
+        except json.JSONDecodeError as exc:
+            raise RepositoryNotInitializedError(
+                f"Repository config is not valid JSON: {self.config_path}"
+            ) from exc
+
+        if not isinstance(raw_config, dict):
+            raise RepositoryNotInitializedError(
+                "Repository config must be a JSON object"
+            )
+
+        try:
+            config = RepoConfig.from_dict(raw_config)
+        except SchemaValidationError as exc:
+            raise RepositoryNotInitializedError(f"Repository config invalid: {exc}") from exc
+
+        if config.created_at_unix_ms is None and set_created_at_if_missing:
+            raw_config = dict(raw_config)
+            raw_config.pop("created_at", None)
+            raw_config["created_at_unix_ms"] = self._unix_ms()
+            config = RepoConfig.from_dict(raw_config)
+            self.config_path.write_text(json.dumps(raw_config, indent=2))
+
+        return config
 
     def _check_schema(self) -> bool:
         """Check if database has the required tables."""
@@ -210,9 +253,18 @@ class AletheiaRepository:
         """Content-address: SHA-256 hex."""
         return hash_bytes(data)
 
+    @staticmethod
+    def _validate_object_id(object_id: str) -> None:
+        """Validate canonical SHA-256 hex object identifiers."""
+        if not OBJECT_ID_RE.fullmatch(object_id):
+            raise RepositoryError(
+                f"Invalid object_id '{object_id}'. Expected 64 lowercase hex characters."
+            )
+
     def _object_path(self, object_id: str) -> Path:
-        """Get storage path using 2-char fanout (ab/abcd...ef)."""
-        return self.objects_dir / object_id[:2] / object_id
+        """Get storage path using configured fanout width (objects/xx/object_id)."""
+        self._validate_object_id(object_id)
+        return self.objects_dir / object_id[: self.object_fanout] / object_id
 
     def _unix_ms(self) -> int:
         """Current timestamp in Unix milliseconds."""
@@ -791,6 +843,40 @@ class AletheiaRepository:
         """
         return self.get_object_bytes(object_id)
 
+    def _enforce_record_overwrite_policy(
+        self, artifact_id: str, existing_json: str, new_json: str
+    ) -> None:
+        """Enforce config-driven overwrite semantics for records/{artifact_id}.json."""
+        if existing_json == new_json:
+            return
+
+        if not self.config.immutability.allow_overwrite:
+            raise ImmutabilityError(
+                f"{artifact_id}: Record already exists and overwrites are disabled"
+            )
+
+        if self.config.immutability.enforce:
+            raise ImmutabilityError(
+                f"{artifact_id}: Non-idempotent record overwrite is forbidden by immutability policy"
+            )
+
+    def _enforce_artifact_row_overwrite_policy(
+        self, artifact_id: str, existing_row: Tuple[Any, ...], new_row: Tuple[Any, ...]
+    ) -> None:
+        """Enforce config-driven overwrite semantics for artifacts table rows."""
+        if tuple(existing_row) == tuple(new_row):
+            return
+
+        if not self.config.immutability.allow_overwrite:
+            raise ImmutabilityError(
+                f"{artifact_id}: Artifact index row already exists and overwrites are disabled"
+            )
+
+        if self.config.immutability.enforce:
+            raise ImmutabilityError(
+                f"{artifact_id}: Non-idempotent artifact index overwrite is forbidden by immutability policy"
+            )
+
     def store_artifact(self, artifact_id: str, record: Dict[str, Any]) -> None:
         """
         Store an artifact record as JSON.
@@ -801,13 +887,40 @@ class AletheiaRepository:
 
         Records stored as: records/{artifact_id}.json
         """
+        record_obj = ArtifactRecord.from_dict(record)
+        normalized_record = record_obj.to_dict()
+        record_json = json.dumps(normalized_record, indent=2)
+
         record_path = self.records_dir / f"{artifact_id}.json"
+        tmp_record_path = self.tmp_dir / f"record.{artifact_id}.{uuid.uuid4().hex}.tmp"
 
-        # Write record
-        record_path.write_text(json.dumps(record, indent=2))
+        if record_path.exists():
+            existing_json = record_path.read_text()
+            self._enforce_record_overwrite_policy(artifact_id, existing_json, record_json)
 
-        # Index in database
-        self.ensure_artifact_indexed(artifact_id)
+            # Idempotent no-op write: preserve existing record bytes.
+            if existing_json == record_json:
+                indexed = self.ensure_artifact_indexed(artifact_id)
+                if not indexed:
+                    raise BrokenArtifactError(
+                        f"{artifact_id}: Failed to index artifact due to missing objects"
+                    )
+                return
+
+        try:
+            # Write record atomically to avoid partial JSON records on crash.
+            tmp_record_path.write_text(record_json)
+            os.replace(str(tmp_record_path), str(record_path))
+
+            # Index in database
+            indexed = self.ensure_artifact_indexed(artifact_id)
+            if not indexed:
+                raise BrokenArtifactError(
+                    f"{artifact_id}: Failed to index artifact due to missing objects"
+                )
+        finally:
+            if tmp_record_path.exists():
+                tmp_record_path.unlink(missing_ok=True)
 
     def ensure_artifact_indexed(
         self,
@@ -835,6 +948,7 @@ class AletheiaRepository:
         Raises:
             BrokenArtifactError: If referenced objects missing and raise_on_broken=True
             IntegrityError: If object content doesn't match content-address
+            ImmutabilityError: If write would mutate existing artifact row under policy
         """
         record_path = self.records_dir / f"{artifact_id}.json"
 
@@ -843,14 +957,11 @@ class AletheiaRepository:
 
         # Load record
         with open(record_path, "r") as f:
-            record = json.load(f)
+            record = ArtifactRecord.from_dict(json.load(f))
 
         # Verify referenced objects exist
-        content_obj_id = record.get("content_object_id")
-        barcode_obj_id = record.get("barcode_object_id")
-
-        if not content_obj_id:
-            raise BrokenArtifactError(f"{artifact_id}: Missing content_object_id")
+        content_obj_id = record.content_object_id
+        barcode_obj_id = record.barcode_object_id
 
         content_path = self._object_path(content_obj_id)
         barcode_path = self._object_path(barcode_obj_id) if barcode_obj_id else None
@@ -894,43 +1005,65 @@ class AletheiaRepository:
         try:
             cursor = conn.cursor()
 
-            scan_params = record.get("scan_params", {})
-
-            # Extract with legacy fallback (canonical keys use _bytes suffix)
-            window_size_bytes = scan_params.get(
-                "window_size_bytes", scan_params.get("window_size", 65536)
+            scan_params = record.scan_params
+            row_values: Tuple[Any, ...] = (
+                record.record_version,
+                str(record_path.relative_to(self.root)),
+                content_obj_id,
+                barcode_obj_id,
+                record.created_at_unix_ms,
+                scan_params.window_size_bytes,
+                scan_params.step_size_bytes,
+                scan_params.m_block_size,
+                scan_params.quant_version,
+                scan_params.barcode_len,
             )
-            step_size_bytes = scan_params.get(
-                "step_size_bytes", scan_params.get("step_size", 16384)
-            )
-            m_block_size = scan_params.get("m_block_size", 1)
-            quant_version = scan_params.get("quant_version", "v0")
-            barcode_len = scan_params.get("barcode_len", 0)
 
             cursor.execute(
                 """
-                INSERT OR REPLACE INTO artifacts (
-                    artifact_id, record_version, record_path,
-                    content_object_id, barcode_object_id,
-                    created_at_unix_ms,
-                    window_size_bytes, step_size_bytes, m_block_size,
-                    quant_version, barcode_len
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                SELECT record_version, record_path, content_object_id, barcode_object_id,
+                       created_at_unix_ms, window_size_bytes, step_size_bytes, m_block_size,
+                       quant_version, barcode_len
+                FROM artifacts
+                WHERE artifact_id = ?
             """,
-                (
-                    artifact_id,
-                    record.get("record_version", "aletheia/ar/1"),
-                    str(record_path.relative_to(self.root)),
-                    content_obj_id,
-                    barcode_obj_id,
-                    record.get("created_at_unix_ms", self._unix_ms()),
-                    window_size_bytes,
-                    step_size_bytes,
-                    m_block_size,
-                    quant_version,
-                    barcode_len,
-                ),
+                (artifact_id,),
             )
+            existing_row = cursor.fetchone()
+
+            if existing_row is not None:
+                self._enforce_artifact_row_overwrite_policy(
+                    artifact_id, tuple(existing_row), row_values
+                )
+                if tuple(existing_row) == row_values:
+                    if close_conn:
+                        conn.commit()
+                    return True
+
+                cursor.execute(
+                    """
+                    UPDATE artifacts
+                    SET record_version = ?, record_path = ?, content_object_id = ?,
+                        barcode_object_id = ?, created_at_unix_ms = ?,
+                        window_size_bytes = ?, step_size_bytes = ?, m_block_size = ?,
+                        quant_version = ?, barcode_len = ?
+                    WHERE artifact_id = ?
+                """,
+                    (*row_values, artifact_id),
+                )
+            else:
+                cursor.execute(
+                    """
+                    INSERT INTO artifacts (
+                        artifact_id, record_version, record_path,
+                        content_object_id, barcode_object_id,
+                        created_at_unix_ms,
+                        window_size_bytes, step_size_bytes, m_block_size,
+                        quant_version, barcode_len
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                    (artifact_id, *row_values),
+                )
 
             if close_conn:
                 conn.commit()
@@ -940,6 +1073,32 @@ class AletheiaRepository:
         finally:
             if close_conn:
                 conn.close()
+
+    def get_recent_artifacts(self, limit: int = 20) -> list:
+        """
+        Get recent artifacts from the repository.
+
+        Args:
+            limit: Maximum number of artifacts to return (default: 20)
+
+        Returns:
+            List of dicts with artifact metadata
+        """
+        conn = self._connect()
+        conn.row_factory = lambda c, r: dict(zip([col[0] for col in c.description], r))
+        cursor = conn.cursor()
+
+        cursor.execute("""
+            SELECT artifact_id, created_at_unix_ms, window_size_bytes,
+                   step_size_bytes, m_block_size, record_path
+            FROM artifacts
+            ORDER BY created_at_unix_ms DESC
+            LIMIT ?
+        """, (limit,))
+
+        artifacts = cursor.fetchall()
+        conn.close()
+        return artifacts
 
     def cleanup_tmp_directory(self, max_age_hours: int = 24) -> int:
         """

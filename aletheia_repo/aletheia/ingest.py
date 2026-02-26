@@ -1,9 +1,5 @@
-#!/usr/bin/env python3
 """
 Aletheia Repository Ingest - Content-Addressed Storage with Barcode Verification
-
-Usage:
-    python ingest.py <file>
 
 This module implements the complete ingest workflow:
 1. Run Odin scanner to produce .albc barcode
@@ -17,26 +13,33 @@ This module implements the complete ingest workflow:
 
 import hashlib
 import json
+import logging
 import os
 import struct
 import subprocess
-import sys
 import tempfile
+import math
+import uuid
 from pathlib import Path
 from datetime import datetime
-from typing import Dict, Any, Optional, Tuple, List
+from typing import Dict, Any, Optional, Tuple, List, Union
 from shutil import which
-from utils import compute_file_hash
+from .utils import hash_and_copy_file
 
-from repository import AletheiaRepository, RepositoryNotInitializedError
+from .domain import ArtifactRecord, ScanParams
+from .repository import AletheiaRepository, RepositoryNotInitializedError
 
 
 try:
-    from identity import IdentityLink, IdentityError
+    from .identity import IdentityLink, IdentityError
 
     IDENTITY_AVAILABLE = True
 except ImportError:
     IDENTITY_AVAILABLE = False
+
+
+DEFAULT_SCANNER_TIMEOUT_SECONDS = 600
+logger = logging.getLogger(__name__)
 
 
 class ALBCParser:
@@ -164,7 +167,10 @@ class ALBCParser:
         raw_offset = result.get("raw_data_offset", 0)
         if raw_offset > 0 and result["format_version"] == 2:
             barcode_len = result["barcode_len"]
-            raw_bytes = albc_data[raw_offset : raw_offset + barcode_len * 8]
+            raw_size = barcode_len * 8
+            if raw_offset + raw_size > len(albc_data):
+                return None
+            raw_bytes = albc_data[raw_offset : raw_offset + raw_size]
             # Unpack as little-endian f64 array
             result["raw_entropy"] = list(struct.unpack(f"<{barcode_len}d", raw_bytes))
 
@@ -235,6 +241,10 @@ class ALBCParser:
         if raw_offset > 0 and result["format_version"] == 2:
             barcode_len = result["barcode_len"]
             raw_size = barcode_len * 8  # 8 bytes per f64
+
+            file_size = file_path.stat().st_size
+            if raw_offset + raw_size > file_size:
+                return None
 
             with open(file_path, "rb") as f:
                 f.seek(raw_offset)
@@ -311,33 +321,81 @@ class ALBCParser:
 
         return regions
 
+    @staticmethod
+    def compare_barcodes_raw(
+        baseline_raw: List[float],
+        actual_raw: List[float],
+        window_size: int,
+        step_size: int,
+        threshold: float = 1e-9,
+    ) -> List[Tuple[int, int, int, int]]:
+        """
+        Compare raw entropy arrays and return contiguous differing regions.
+
+        A window is considered different when abs(delta) > threshold.
+        """
+        if len(baseline_raw) != len(actual_raw):
+            comparable = min(len(baseline_raw), len(actual_raw))
+            if comparable == 0:
+                return []
+            total_bytes = comparable * step_size + (window_size - step_size)
+            return [(0, comparable - 1, 0, total_bytes)]
+
+        differing_windows = [
+            i
+            for i, (a, b) in enumerate(zip(baseline_raw, actual_raw))
+            if abs(a - b) > threshold
+        ]
+        if not differing_windows:
+            return []
+
+        regions: List[Tuple[int, int, int, int]] = []
+        region_start = differing_windows[0]
+        region_end = differing_windows[0]
+
+        for window_idx in differing_windows[1:]:
+            if window_idx == region_end + 1:
+                region_end = window_idx
+                continue
+
+            start_byte = region_start * step_size
+            end_byte = region_end * step_size + window_size
+            regions.append((region_start, region_end, start_byte, end_byte))
+            region_start = window_idx
+            region_end = window_idx
+
+        start_byte = region_start * step_size
+        end_byte = region_end * step_size + window_size
+        regions.append((region_start, region_end, start_byte, end_byte))
+        return regions
+
 
 class ArtifactRecordBuilder:
     """Builder for Aletheia Artifact Records (aletheia/ar/1)."""
 
-    VERSION = "aletheia/ar/1"
+    VERSION = ArtifactRecord.VERSION
 
     @staticmethod
     def build(
         content_object_id: str,
         barcode_object_id: str,
-        scan_params: Dict[str, Any],
+        scan_params: Union[ScanParams, Dict[str, Any]],
         created_at_unix_ms: int,
         original_filename: str,
     ) -> Dict[str, Any]:
         """Build a complete Artifact Record."""
-        return {
-            "record_version": ArtifactRecordBuilder.VERSION,
-            "content_object_id": content_object_id,
-            "barcode_object_id": barcode_object_id,
-            "scan_params": scan_params,
-            "created_at_unix_ms": created_at_unix_ms,
-            "metadata": {
-                "original_filename": original_filename,
-                "ingested_from": "local",
-                "chain_of_custody": "single_node",
-            },
-        }
+        scan_params_obj = (
+            scan_params if isinstance(scan_params, ScanParams) else ScanParams.from_dict(scan_params)
+        )
+        record = ArtifactRecord(
+            record_version=ArtifactRecordBuilder.VERSION,
+            content_object_id=content_object_id,
+            barcode_object_id=barcode_object_id,
+            scan_params=scan_params_obj,
+            created_at_unix_ms=created_at_unix_ms,
+            metadata=ArtifactRecord.default_metadata(original_filename),
+        )
+        return record.to_dict()
 
     @staticmethod
     def derive_artifact_id(content_object_id: str, barcode_object_id: str) -> str:
@@ -361,15 +419,21 @@ class ArtifactRecordBuilder:
 class OdinScanner:
     """Interface to Odin entropy scanner."""
 
-    def __init__(self, odin_binary: Optional[str] = None):
+    def __init__(
+        self, odin_binary: Optional[str] = None, require_binary: bool = True
+    ):
         """
         Initialize scanner.
 
         Args:
             odin_binary: Path to compiled Odin entropy binary.
                         If None, assumes 'entropy' in PATH or looks in relative paths.
+            require_binary: If False, skip binary resolution for parser-only operations.
         """
-        self.odin_binary = odin_binary or self._find_binary()
+        if require_binary:
+            self.odin_binary = odin_binary or self._find_binary()
+        else:
+            self.odin_binary = odin_binary or ""
 
     def _find_binary(self) -> str:
         """Locate the Odin entropy scanner binary."""
@@ -421,6 +485,7 @@ class OdinScanner:
         start_byte: int = 0,
         end_byte: int = 0,
         output_format: int = 1,  # NEW: ALBC format version (1 or 2)
+        timeout_seconds: int = DEFAULT_SCANNER_TIMEOUT_SECONDS,
     ) -> Tuple[bytes, str]:
         """
         Run Odin scanner on file.
@@ -435,6 +500,7 @@ class OdinScanner:
             start_byte: Start offset for partial scan (0=beginning)
             end_byte: End offset for partial scan (0=end of file)
             output_format: ALBC output format version (1=quantized, 2=quantized+raw)
+            timeout_seconds: Scanner subprocess timeout in seconds
 
         Returns:
             (albc_bytes, temp_path): The barcode data and temporary file path
@@ -472,21 +538,41 @@ class OdinScanner:
             cmd.append("--quiet")
 
         if verbose:
-            print(f"  Running: {' '.join(cmd)}")
+            logger.info("Running scanner command: %s", " ".join(cmd))
 
         try:
-            result = subprocess.run(cmd, capture_output=True, text=True, check=True)
+            result = subprocess.run(
+                cmd,
+                capture_output=True,
+                text=True,
+                check=True,
+                timeout=timeout_seconds,
+            )
 
             if verbose and result.stdout:
-                print(result.stdout, end="")
+                logger.info("%s", result.stdout.rstrip())
 
             # Read the generated barcode file
             albc_bytes = Path(tmp_path).read_bytes()
             return albc_bytes, tmp_path
 
+        except subprocess.TimeoutExpired as e:
+            try:
+                Path(tmp_path).unlink()
+            except OSError:
+                pass
+            raise TimeoutError(
+                f"Scanner timed out after {timeout_seconds}s for file: {file_path}"
+            ) from e
         except subprocess.CalledProcessError as e:
-            print(f"Scanner error: {e.stderr}", file=sys.stderr)
+            logger.error("Scanner error: %s", (e.stderr or "").strip())
             # Clean up temp file
+            try:
+                Path(tmp_path).unlink()
+            except OSError:
+                pass
+            raise
+        except Exception:
             try:
                 Path(tmp_path).unlink()
             except OSError:
@@ -497,10 +583,7 @@ class OdinScanner:
         self, file1_path: str, file2_path: str, threshold: float = 0.0
     ) -> Dict[str, Any]:
         """
-        Compare two barcode files using Odin entropy diff.
-
-        This delegates to the Odin binary rather than reimplementing
-        comparison logic in Python - single source of truth.
+        Compare two barcode files in Python using ALBC parser output.
 
         Args:
             file1_path: Path to first .albc file (baseline)
@@ -525,17 +608,48 @@ class OdinScanner:
             }
 
         Raises:
-            subprocess.CalledProcessError: If diff command fails
-            json.JSONDecodeError: If output parsing fails
+            ValueError: If ALBC files are invalid or incomparable
         """
-        cmd = [self.odin_binary, "diff", file1_path, file2_path, "--json"]
+        parser = ALBCParser()
+        parsed1 = parser.parse_from_file(Path(file1_path))
+        parsed2 = parser.parse_from_file(Path(file2_path))
 
-        if threshold > 0:
-            cmd.extend(["--threshold", str(threshold)])
+        if parsed1 is None:
+            raise ValueError(f"Invalid or truncated ALBC file: {file1_path}")
+        if parsed2 is None:
+            raise ValueError(f"Invalid or truncated ALBC file: {file2_path}")
 
-        result = subprocess.run(cmd, capture_output=True, text=True, check=True)
+        payload1 = parsed1.get("barcode_payload", b"")
+        payload2 = parsed2.get("barcode_payload", b"")
 
-        return json.loads(result.stdout)
+        windows_compared = min(len(payload1), len(payload2))
+        if windows_compared == 0:
+            raise ValueError("No comparable windows in ALBC files")
+
+        deltas = [
+            abs(payload1[i] - payload2[i])
+            for i in range(windows_compared)
+        ]
+        avg_delta = sum(deltas) / windows_compared
+        rms_delta = math.sqrt(sum(d * d for d in deltas) / windows_compared)
+        max_delta = max(deltas)
+        max_delta_window = deltas.index(max_delta)
+        windows_above_threshold = sum(1 for d in deltas if d > threshold)
+
+        return {
+            "file1": str(file1_path),
+            "file2": str(file2_path),
+            "windows_compared": windows_compared,
+            "avg_delta_raw": avg_delta,
+            "avg_delta_normalized": avg_delta / 255.0,
+            "rms_delta_raw": rms_delta,
+            "rms_delta_normalized": rms_delta / 255.0,
+            "max_delta_raw": float(max_delta),
+            "max_delta_normalized": float(max_delta) / 255.0,
+            "max_delta_window": max_delta_window,
+            "windows_above_threshold": windows_above_threshold,
+            "threshold": float(threshold),
+        }
 
 
 class IngestPipeline:
@@ -558,7 +672,7 @@ class IngestPipeline:
         try:
             self.repo = AletheiaRepository(repo_root, auto_init=auto_init)
         except RepositoryNotInitializedError as e:
-            print(f"Error: {e}", file=sys.stderr)
+            logger.error("Repository initialization failed: %s", e)
             raise
 
         self.scanner = OdinScanner(odin_binary)
@@ -614,46 +728,56 @@ class IngestPipeline:
         if not file_path_obj.exists():
             raise FileNotFoundError(f"File not found: {file_path}")
 
-        if verbose:
-            print(f"\n=== Ingesting: {file_path_obj.name} ===\n")
+        snapshot_path = self.repo.tmp_dir / f"snapshot.{uuid.uuid4().hex}.bin"
+        temp_albc_path: Optional[str] = None
 
-        # Step 1: Run Odin scanner (generates barcode file)
         if verbose:
-            print(
-                f"[1/7] Running Odin scanner (window={window_size}, step={step_size}, m={m})..."
-            )
-        albc_bytes, temp_albc_path = self.scanner.scan(
-            file_path,
-            window_size=window_size,
-            step_size=step_size,
-            m=m,
-            threads=threads,
-            verbose=verbose,
-            output_format=output_format,  # NEW: Pass format version
-        )
+            logger.info("=== Ingesting: %s ===", file_path_obj.name)
 
         try:
-            # Step 2: Compute content hash (streaming - no RAM limit)
+            # Step 1: Snapshot source and hash in a single pass.
             if verbose:
-                print("[2/7] Computing content hash (streaming)...")
-            content_object_id, file_size = compute_file_hash(file_path_obj)
+                logger.info("[1/7] Capturing immutable ingest snapshot...")
+            content_object_id, file_size = hash_and_copy_file(file_path_obj, snapshot_path)
 
+            # Step 2: Run Odin scanner against snapshot (not mutable source file).
             if verbose:
+                logger.info(
+                    "[2/7] Running Odin scanner (window=%s, step=%s, m=%s)...",
+                    window_size,
+                    step_size,
+                    m,
+                )
+            albc_bytes, temp_albc_path = self.scanner.scan(
+                str(snapshot_path),
+                window_size=window_size,
+                step_size=step_size,
+                m=m,
+                threads=threads,
+                verbose=verbose,
+                output_format=output_format,
+            )
+
+            # Step 3: Content hash was computed from snapshot.
+            if verbose:
+                logger.info("[3/7] Finalizing content hash...")
                 size_mb = file_size / (1024 * 1024)
-                print(f"  File size: {file_size:,} bytes ({size_mb:.2f} MB)")
-                print(f"  content_object_id: {content_object_id[:16]}...")
+                logger.info("  File size: %s bytes (%.2f MB)", f"{file_size:,}", size_mb)
+                logger.info("  content_object_id: %s...", content_object_id[:16])
 
-            # Step 3: Compute barcode hash (barcodes are small, can use in-memory)
+            # Step 4: Compute barcode hash (barcodes are small, can use in-memory)
             if verbose:
-                print("[3/7] Computing barcode hash...")
+                logger.info("[4/7] Computing barcode hash...")
             barcode_object_id = hashlib.sha256(albc_bytes).hexdigest()
 
             if verbose:
                 barcode_size_kb = len(albc_bytes) / 1024
-                print(
-                    f"  Barcode size: {len(albc_bytes):,} bytes ({barcode_size_kb:.2f} KB)"
+                logger.info(
+                    "  Barcode size: %s bytes (%.2f KB)",
+                    f"{len(albc_bytes):,}",
+                    barcode_size_kb,
                 )
-                print(f"  barcode_object_id: {barcode_object_id[:16]}...")
+                logger.info("  barcode_object_id: %s...", barcode_object_id[:16])
 
             # Derive artifact_id early for idempotency check
             artifact_id = ArtifactRecordBuilder.derive_artifact_id(
@@ -665,49 +789,51 @@ class IngestPipeline:
                 self.repo.ensure_artifact_indexed(artifact_id)
 
                 if verbose:
-                    print(f"\n⊙ Artifact already exists: {artifact_id[:16]}...")
-                    print(f"  Skipping re-ingestion (idempotent operation)")
-                    print(f"  Content:     {content_object_id}")
-                    print(f"  Barcode:     {barcode_object_id}")
+                    logger.info("Artifact already exists: %s...", artifact_id[:16])
+                    logger.info("  Skipping re-ingestion (idempotent operation)")
+                    logger.info("  Content:     %s", content_object_id)
+                    logger.info("  Barcode:     %s", barcode_object_id)
                 return artifact_id
 
-            # Step 4: Store content object (streaming copy - only reads file once more)
+            # Step 5: Store content object from immutable snapshot.
             if verbose:
-                print("[4/7] Storing content object (streaming)...")
-            self.repo.store_object_from_file(file_path, "content")
+                logger.info("[5/7] Storing content object (streaming)...")
+            stored_content_id, stored_size = self.repo.store_object_from_file(
+                str(snapshot_path), "content"
+            )
+            if stored_content_id != content_object_id or stored_size != file_size:
+                raise ValueError(
+                    "Stored content hash/size mismatch against ingest snapshot. "
+                    f"expected=({content_object_id}, {file_size}), "
+                    f"actual=({stored_content_id}, {stored_size})"
+                )
 
-            # Step 5: Store barcode object (small, can use in-memory)
+            # Step 6: Store barcode object (small, can use in-memory)
             if verbose:
-                print("[5/7] Storing barcode object...")
+                logger.info("[6/7] Storing barcode object...")
             self.repo.store_object(albc_bytes, "barcode")
 
-            # Step 6: Parse ALBC header (only reads 32-40 bytes depending on version)
+            # Step 7: Parse ALBC header (only reads 32-40 bytes depending on version)
             if verbose:
-                print("[6/7] Parsing barcode header...")
+                logger.info("[7/7] Parsing barcode header...")
             header = self.parser.parse_header(albc_bytes)
             if header is None:
                 raise ValueError("Failed to parse ALBC header")
 
-            # Build scan_params with canonical _bytes key names
-            scan_params = {
-                "window_size_bytes": header["window_size_bytes"],
-                "step_size_bytes": header["step_size_bytes"],
-                "m_block_size": header["m_block_size"],
-                "quant_version": header["quant_version"],
-                "barcode_len": header["barcode_len"],
-                "format_version": header.get("format_version", 1),
-                "raw_data_offset": header.get("raw_data_offset", 0),
-            }
+            scan_params = ScanParams.from_albc_header(header)
 
             if verbose:
-                print(
-                    f"  Scan params: WS={scan_params['window_size_bytes']}, SS={scan_params['step_size_bytes']}, m={scan_params['m_block_size']}"
+                logger.info(
+                    "  Scan params: WS=%s, SS=%s, m=%s",
+                    scan_params.window_size_bytes,
+                    scan_params.step_size_bytes,
+                    scan_params.m_block_size,
                 )
-                print(f"  Format version: ALBC000{scan_params['format_version']}")
+                logger.info("  Format version: ALBC000%s", scan_params.format_version)
 
-            # Step 7: Build and store artifact record
+            # Finalize: Build and store artifact record
             if verbose:
-                print("[7/7] Building Artifact Record...")
+                logger.info("[final] Building Artifact Record...")
 
             created_at_unix_ms = int(datetime.utcnow().timestamp() * 1000)
 
@@ -722,7 +848,7 @@ class IngestPipeline:
             # NEW: Sign artifact record if requested
             if sign_with:
                 if verbose:
-                    print(f"[7b/7] Signing artifact record with key: {sign_with}...")
+                    logger.info("[final-sign] Signing artifact record with key: %s...", sign_with)
 
                 if not self.identity:
                     raise ValueError(
@@ -736,115 +862,38 @@ class IngestPipeline:
                     artifact_record["identity_link"] = signature_block
 
                     if verbose:
-                        print(f"  Signed by:    {signature_block['key_id']}")
-                        print(f"  Fingerprint:  {signature_block['fingerprint']}")
-                        print(f"  Signed at:    {signature_block['signed_at']}")
+                        logger.info("  Signed by:    %s", signature_block["key_id"])
+                        logger.info("  Fingerprint:  %s", signature_block["fingerprint"])
+                        logger.info("  Signed at:    %s", signature_block["signed_at"])
 
                 except Exception as e:
                     raise ValueError(f"Failed to sign artifact: {e}")
 
             if verbose:
-                print(f"  artifact_id: {artifact_id[:16]}...")
+                logger.info("  artifact_id: %s...", artifact_id[:16])
 
             self.repo.store_artifact(artifact_id, artifact_record)
 
             if verbose:
-                print(f"\n✓ Successfully ingested: {file_path_obj.name}")
-                print(f"  Artifact ID: {artifact_id}")
-                print(f"  Content:     {content_object_id}")
-                print(f"  Barcode:     {barcode_object_id}")
-                print(f"  Record:      records/{artifact_id}.json")
+                logger.info("Successfully ingested: %s", file_path_obj.name)
+                logger.info("  Artifact ID: %s", artifact_id)
+                logger.info("  Content:     %s", content_object_id)
+                logger.info("  Barcode:     %s", barcode_object_id)
+                logger.info("  Record:      records/%s.json", artifact_id)
 
             return artifact_id
 
         finally:
             # Cleanup temp barcode file unless requested to keep
-            if not keep_temp:
+            if temp_albc_path and not keep_temp:
                 try:
                     Path(temp_albc_path).unlink()
                 except OSError:
                     pass
+            # Snapshot is always temporary.
+            try:
+                snapshot_path.unlink()
+            except OSError:
+                pass
 
 
-# Update main() CLI argument parsing:
-
-
-def main():
-    """CLI entry point for repo ingest."""
-    if len(sys.argv) < 2:
-        print("Usage: python ingest.py <file> [options]")
-        print("Options:")
-        print("  --window <size>    Window size (default: 65536)")
-        print("  --step <size>      Step size (default: 16384)")
-        print("  --m <size>         Block size (default: 1)")
-        print("  --threads <n>      Thread count (default: auto)")
-        print("  --format <version> ALBC format version: 1 or 2 (default: 1)")
-        print("  --repo <path>      Repository root (default: .)")
-        print("  --quiet            Suppress output")
-        sys.exit(1)
-
-    file_path = sys.argv[1]
-
-    kwargs = {
-        "window_size": 65536,
-        "step_size": 16384,
-        "m": 1,
-        "threads": 0,
-        "verbose": True,
-        "keep_temp": False,
-        "output_format": 1,  # NEW: Default to v1
-    }
-    repo_root = "."
-    auto_init = True
-
-    i = 2
-    while i < len(sys.argv):
-        arg = sys.argv[i]
-
-        if arg == "--window" and i + 1 < len(sys.argv):
-            kwargs["window_size"] = int(sys.argv[i + 1])
-            i += 2
-        elif arg == "--step" and i + 1 < len(sys.argv):
-            kwargs["step_size"] = int(sys.argv[i + 1])
-            i += 2
-        elif arg == "--m" and i + 1 < len(sys.argv):
-            kwargs["m"] = int(sys.argv[i + 1])
-            i += 2
-        elif arg == "--threads" and i + 1 < len(sys.argv):
-            kwargs["threads"] = int(sys.argv[i + 1])
-            i += 2
-        elif arg == "--format" and i + 1 < len(sys.argv):  # NEW
-            kwargs["output_format"] = int(sys.argv[i + 1])
-            i += 2
-        elif arg == "--repo" and i + 1 < len(sys.argv):
-            repo_root = sys.argv[i + 1]
-            i += 2
-        elif arg == "--quiet":
-            kwargs["verbose"] = False
-            i += 1
-        elif arg == "--keep-temp":
-            kwargs["keep_temp"] = True
-            i += 1
-        elif arg == "--no-init":
-            auto_init = False
-            i += 1
-        else:
-            i += 1
-
-    try:
-        pipeline = IngestPipeline(repo_root=repo_root, auto_init=auto_init)
-        artifact_id = pipeline.ingest(file_path, **kwargs)
-        sys.exit(0)
-    except RepositoryNotInitializedError:
-        # Already printed error message
-        sys.exit(1)
-    except Exception as e:
-        print(f"Error: {e}", file=sys.stderr)
-        import traceback
-
-        traceback.print_exc()
-        sys.exit(1)
-
-
-if __name__ == "__main__":
-    main()

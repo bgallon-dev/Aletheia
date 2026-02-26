@@ -13,73 +13,85 @@ Aletheia provides cryptographic and forensic verification of files through:
 ## Installation
 
 ```bash
-# 1. Compile the Odin entropy scanner
-cd ../entropy/odin_entropy
-odin build . -out:entropy.exe
+# 1. Install editable package and CLI entrypoint
+pip install -e .
 
-# 2. (Optional) Install cryptography for digital signatures
+# 2. Compile the Odin entropy scanner
+odin build entropy.odin -file -o:speed -out:entropy.exe
+
+# 3. (Optional) Install cryptography for digital signatures
 pip install cryptography
 
-# 3. Initialize repository (auto-created on first ingest)
-cd ../../alethaia_repo
-python repo.py ingest <any-file>
+# 4. Initialize repository (auto-created on first ingest)
+aletheia ingest <any-file>
 ```
 
 ## Quick Start
 
 ```bash
 # Ingest a file
-python repo.py ingest document.pdf
+aletheia ingest document.pdf
 
 # Verify the file later
-python repo.py verify <artifact_id> --file document.pdf
+aletheia verify <artifact_id> --file document.pdf
 
 # List all artifacts
-python repo.py list
+aletheia list
 
 # Run integrity audit
-python repo.py audit
+aletheia audit
 ```
+
+For an interview-friendly end-to-end walkthrough, see [`PORTFOLIO_DEMO.md`](PORTFOLIO_DEMO.md).
 
 ## Commands
 
-### `repo ingest <file>`
+### `aletheia ingest <file>`
 
 Ingest a file into the repository with entropy barcode generation.
 
 ```bash
-python repo.py ingest example.pdf
-python repo.py ingest example.pdf --window 65536 --step 16384 --m 1
-python repo.py ingest large_video.mp4 --threads 8
+aletheia ingest example.pdf
+aletheia ingest example.pdf --window 65536 --step 16384 --m 1
+aletheia ingest large_video.mp4 --threads 8
 
 # With digital signature
-python repo.py ingest evidence.pdf --sign analyst-alice --passphrase
+aletheia ingest evidence.pdf --sign analyst-alice --passphrase
+
+# High-precision mode (stores raw f64 entropy values for forensic zoom)
+aletheia ingest evidence.pdf --format 2
 ```
 
 **Options:**
 
-| Option             | Description                                        |
-| ------------------ | -------------------------------------------------- |
-| `--window <bytes>` | Entropy window size (default: 65536 / 64KB)        |
-| `--step <bytes>`   | Step size between windows (default: 16384 / 16KB)  |
-| `--m <1\|2>`       | Block size for entropy calculation (default: 1)    |
-| `--threads <N>`    | Thread count for parallel scanning (default: auto) |
-| `--repo <path>`    | Repository root directory (default: .)             |
-| `--no-auto-init`   | Don't auto-initialize repository                   |
-| `--quiet`          | Suppress verbose output                            |
-| `--keep-temp`      | Keep temporary .albc barcode file                  |
-| `--sign <key_id>`  | Sign artifact with specified key                   |
-| `--passphrase`     | Prompt for key passphrase                          |
+| Option             | Description                                            |
+| ------------------ | ------------------------------------------------------ |
+| `--window <bytes>` | Entropy window size (default: 65536 / 64KB)            |
+| `--step <bytes>`   | Step size between windows (default: 16384 / 16KB)      |
+| `--m <1\|2>`       | Block size for entropy calculation (default: 1)        |
+| `--threads <N>`    | Thread count for parallel scanning (default: auto)     |
+| `--format <1\|2>`  | ALBC format version (1=quantized, 2=quantized+raw f64) |
+| `--repo <path>`    | Repository root directory (default: .)                 |
+| `--no-auto-init`   | Don't auto-initialize repository                       |
+| `--quiet`          | Suppress verbose output                                |
+| `--keep-temp`      | Keep temporary .albc barcode file                      |
+| `--sign <key_id>`  | Sign artifact with specified key                       |
+| `--passphrase`     | Prompt for key passphrase                              |
+
+**Format Versions:**
+
+- **Format 1 (default)**: Stores quantized u8 entropy values (1 byte per window). Suitable for most use cases.
+- **Format 2**: Stores both quantized u8 AND raw f64 entropy values. Required for sub-quantization precision during forensic zoom scans. Larger file size but detects changes below the u8 quantization threshold (Δ < 0.001 entropy).
 
 **Idempotent**: Re-ingesting the same file with identical parameters produces the same artifact ID.
 
-### `repo verify <artifact_id> --file <path>`
+### `aletheia verify <artifact_id> --file <path>`
 
 Verify a file against a stored artifact with three independent checks:
 
 ```bash
-python repo.py verify abc123... --file document.pdf
-python repo.py verify abc123... --file document.pdf --no-zoom
+aletheia verify abc123... --file document.pdf
+aletheia verify abc123... --file document.pdf --no-zoom
 ```
 
 **Verification Checks:**
@@ -96,45 +108,46 @@ python repo.py verify abc123... --file document.pdf --no-zoom
 | `--repo <path>` | Repository root (default: .)                 |
 | `--quiet`       | Suppress verbose output                      |
 | `--no-zoom`     | Disable zoom scan (coarse localization only) |
+| `--require-signature` | Require valid identity signature (fails if missing/invalid) |
 
-**Zoom Scan**: When forensic check fails, automatically performs high-resolution analysis on modified regions (8× finer than baseline) to precisely localize changes.
+**Zoom Scan**: When forensic check fails, automatically performs high-resolution analysis on modified regions (8× finer than baseline) to precisely localize changes. If the baseline was ingested with `--format 2`, zoom scan uses raw f64 comparison for sub-quantization precision.
 
-### `repo show <artifact_id>`
+### `aletheia show <artifact_id>`
 
 Display detailed artifact information.
 
 ```bash
-python repo.py show abc123def456...
+aletheia show abc123def456...
 ```
 
-### `repo list`
+### `aletheia list`
 
 List recent artifacts with scan parameters.
 
 ```bash
-python repo.py list
-python repo.py list --limit 100
+aletheia list
+aletheia list --limit 100
 ```
 
-### `repo identity <subcommand>`
+### `aletheia identity <subcommand>`
 
 Manage signing keys for identity links.
 
 ```bash
 # Generate a new signing key
-python repo.py identity generate analyst-alice --name "Alice Smith" --email alice@example.com
+aletheia identity generate analyst-alice --name "Alice Smith" --email alice@example.com
 
 # Generate with passphrase protection
-python repo.py identity generate analyst-bob --passphrase
+aletheia identity generate analyst-bob
 
 # List available keys
-python repo.py identity list
+aletheia identity list
 
 # Export public key for distribution
-python repo.py identity export analyst-alice > alice-public.json
+aletheia identity export analyst-alice > alice-public.json
 
 # Import a public key from colleague
-python repo.py identity import colleague-public.json
+aletheia identity import colleague-public.json
 ```
 
 **Subcommands:**
@@ -153,17 +166,35 @@ python repo.py identity import colleague-public.json
 | `--name <name>`   | Key owner name                   |
 | `--email <email>` | Key owner email                  |
 | `--org <org>`     | Organization                     |
-| `--passphrase`    | Prompt for encryption passphrase |
+| `--passphrase`    | Prompt for encryption passphrase (default) |
+| `--no-passphrase` | Store private key unencrypted (not recommended) |
 
-### `repo audit`
+### `aletheia diff <file1.albc> <file2.albc>`
+
+Compare two ALBC barcode files.
+
+```bash
+aletheia diff baseline.albc suspect.albc
+aletheia diff baseline.albc suspect.albc --threshold 2.5
+aletheia diff baseline.albc suspect.albc --json
+```
+
+**Options:**
+
+| Option              | Description                          |
+| ------------------- | ------------------------------------ |
+| `--threshold <num>` | Count windows with delta > threshold |
+| `--json`            | Output machine-readable JSON         |
+
+### `aletheia audit`
 
 Deep integrity audit of all repository objects.
 
 ```bash
-python repo.py audit
-python repo.py audit --no-orphans    # Skip orphan file detection
-python repo.py audit --json          # Output as JSON
-python repo.py audit --output report.txt
+aletheia audit
+aletheia audit --no-orphans    # Skip orphan file detection
+aletheia audit --json          # Output as JSON
+aletheia audit --output report.txt
 ```
 
 **Options:**
@@ -182,23 +213,23 @@ python repo.py audit --output report.txt
 - **Corrupted Objects**: Files where hash ≠ object_id (BIT ROT / TAMPERING)
 - **Orphaned Objects**: Files on disk not in database (JUNK DATA)
 
-### `repo rebuild`
+### `aletheia rebuild`
 
 Rebuild SQLite index from filesystem (disaster recovery).
 
 ```bash
-python repo.py rebuild
-python repo.py rebuild --verify    # Re-hash all objects (slow but thorough)
-python repo.py rebuild --strict    # Stop on first broken artifact
+aletheia rebuild
+aletheia rebuild --verify    # Re-hash all objects (slow but thorough)
+aletheia rebuild --strict    # Stop on first broken artifact
 ```
 
-### `repo cleanup`
+### `aletheia cleanup`
 
 Clean up abandoned temporary files.
 
 ```bash
-python repo.py cleanup
-python repo.py cleanup --max-age 48  # Files older than 48 hours
+aletheia cleanup
+aletheia cleanup --max-age 48  # Files older than 48 hours
 ```
 
 ## Verification Output
@@ -308,7 +339,8 @@ JSON records link content + barcode + metadata + optional signature:
     "step_size_bytes": 16384,
     "m_block_size": 1,
     "quant_version": "v0",
-    "barcode_len": 1024
+    "barcode_len": 1024,
+    "format_version": 2
   },
   "created_at_unix_ms": 1699999999000,
   "metadata": {
@@ -344,6 +376,31 @@ alethaia_repo/
     └── analyst-alice.pub   # Public key (distributable)
 ```
 
+### Repository Config
+
+`config.json` is validated on repository load:
+
+```json
+{
+  "version": "aletheia/repo/1",
+  "storage": {
+    "hash_algorithm": "sha256",
+    "object_fanout": 2
+  },
+  "immutability": {
+    "enforce": true,
+    "allow_overwrite": false
+  },
+  "created_at_unix_ms": 1700000000000
+}
+```
+
+- `storage.hash_algorithm` is currently fixed to `sha256`.
+- `storage.object_fanout` is the source of truth for object layout (`objects/<fanout>/<object_id>`), currently constrained to `2`.
+- `immutability.enforce=true` forbids semantic rewrites of existing artifact records and artifact index rows.
+- `immutability.allow_overwrite=false` blocks overwrites; if set `true` with enforcement still enabled, only byte-identical idempotent rewrites are allowed.
+- `created_at_unix_ms` is set during repository initialization and then treated as immutable metadata.
+
 ## Identity System
 
 ### Trust Model
@@ -362,19 +419,19 @@ alethaia_repo/
 
 ```bash
 # Analyst generates their key
-python repo.py identity generate analyst-alice --passphrase
+aletheia identity generate analyst-alice --passphrase
 
 # Analyst ingests and signs evidence
-python repo.py ingest evidence.pdf --sign analyst-alice --passphrase
+aletheia ingest evidence.pdf --sign analyst-alice --passphrase
 
 # Analyst exports public key for verifiers
-python repo.py identity export analyst-alice > alice-public.json
+aletheia identity export analyst-alice > alice-public.json
 
 # Verifier imports analyst's public key
-python repo.py identity import alice-public.json
+aletheia identity import alice-public.json
 
 # Verifier can now verify signed artifacts
-python repo.py verify <artifact_id> --file evidence.pdf
+aletheia verify <artifact_id> --file evidence.pdf
 ```
 
 ## Performance Notes
@@ -398,7 +455,7 @@ python repo.py verify <artifact_id> --file evidence.pdf
 
 ## Barcode Format (ALBC)
 
-32-byte header + quantized entropy bytes:
+### ALBC v1 (Standard) - 32-byte header + quantized bytes
 
 ```
 Offset  Size  Field
@@ -411,18 +468,40 @@ Offset  Size  Field
 32      N     Quantized entropy values (1 byte per window)
 ```
 
+### ALBC v2 (Extended) - 40-byte header + quantized + raw f64
+
+```
+Offset  Size  Field
+0       8     Magic "ALBC0002"
+8       4     window_size_bytes (u32 LE)
+12      4     step_size_bytes (u32 LE)
+16      4     m_block_size (u32 LE)
+20      4     quant_version (u32 LE)
+24      8     barcode_len (u64 LE)
+32      8     raw_data_offset (u64 LE) - offset to f64 array (0 if not present)
+40      N     Quantized entropy values (1 byte per window)
+40+N    N*8   Raw f64 entropy values (8 bytes per window)
+```
+
+**When to use ALBC v2:**
+
+- Forensic investigations requiring sub-quantization precision
+- Detection of changes with entropy delta < 0.001
+- Zoom scan comparisons needing exact entropy values
+
 ## Direct Module Usage
 
 ### Ingest Pipeline
 
 ```python
-from ingest import IngestPipeline
+from aletheia.ingest import IngestPipeline
 
 pipeline = IngestPipeline(repo_root=".")
 artifact_id = pipeline.ingest(
     "document.pdf",
     window_size=65536,
     step_size=16384,
+    output_format=2,  # Use ALBC v2 for high precision
     sign_with="analyst-alice",
     passphrase="secret"
 )
@@ -431,7 +510,7 @@ artifact_id = pipeline.ingest(
 ### Verification
 
 ```python
-from verify import ArtifactVerifier
+from aletheia.verify import ArtifactVerifier
 
 verifier = ArtifactVerifier(repo_root=".")
 result = verifier.verify(artifact_id, "document.pdf", enable_zoom=True)
@@ -447,7 +526,7 @@ else:
 ### Identity Operations
 
 ```python
-from identity import IdentityLink
+from aletheia.identity import IdentityLink
 
 identity = IdentityLink()
 
@@ -469,7 +548,7 @@ print(f"Valid: {result['valid']}")
 ### Repository Operations
 
 ```python
-from repository import AletheiaRepository
+from aletheia.repository import AletheiaRepository
 
 repo = AletheiaRepository(".", auto_init=True)
 
@@ -492,9 +571,12 @@ stats = repo.audit_objects(verbose=True, check_orphans=True)
 ## Requirements
 
 - Python 3.8+
-- Odin entropy scanner (compiled binary)
+- Odin entropy scanner (compiled binary, Windows-first build)
 - Optional: `cryptography` package for digital signatures
+
+**Platform note:** the current scanner implementation is Windows-first. The Python CLI runs on other platforms, but ingest/verify scanning requires a compatible `entropy` binary.
 
 ```bash
 pip install cryptography  # For identity/signature features
 ```
+

@@ -1,9 +1,5 @@
-#!/usr/bin/env python3
 """
 Aletheia Repository Verify - Cryptographic and Forensic Verification with Zoom Scan
-
-Usage:
-    python verify.py <artifact_id> --file <path>
 
 Verification performs two independent checks:
 1. Cryptographic: SHA-256(file) == content_object_id
@@ -16,23 +12,25 @@ stored baseline content object for comparison.
 
 import hashlib
 import json
-import sys
-import tempfile
+import logging
 from pathlib import Path
 from typing import Dict, Any, Tuple, List, Optional
 
-from repository import AletheiaRepository, RepositoryNotInitializedError
-from ingest import OdinScanner, ALBCParser
-from utils import compute_file_hash
+from .domain import ArtifactRecord, SchemaValidationError
+from .repository import AletheiaRepository, RepositoryNotInitializedError
+from .ingest import OdinScanner, ALBCParser
+from .utils import compute_file_hash
 
 
 # Zoom scan parameters (8× finer resolution than baseline)
 ZOOM_WINDOW_SIZE = 8192  # 8 KiB
 ZOOM_STEP_SIZE = 2048  # 2 KiB
 ZOOM_MARGIN_WINDOWS = 2  # Include 2 windows before/after for context
+ZOOM_RAW_THRESHOLD = 1e-9
+logger = logging.getLogger(__name__)
 
 try:
-    from identity import IdentityLink, SignatureInvalidError
+    from .identity import IdentityLink, SignatureInvalidError
 
     IDENTITY_AVAILABLE = True
 except ImportError:
@@ -91,6 +89,7 @@ class VerificationResult:
         # NEW: Signature verification results
         self.signature_present = False
         self.signature_valid = False
+        self.signature_required = False
         self.signature_key_id: Optional[str] = None
         self.signature_fingerprint: Optional[str] = None
         self.signature_signed_at: Optional[str] = None
@@ -100,10 +99,15 @@ class VerificationResult:
         """Check if verification passed."""
         if self.error:
             return False
-        if self.forensic_skipped:
-            return self.cryptographic_match
-        # Note: Signature check is informational, not required for pass
-        return self.cryptographic_match and self.forensic_match
+        if self.signature_required and not self.signature_present:
+            return False
+        if self.signature_present and not self.signature_valid:
+            return False
+
+        forensic_ok = (
+            self.cryptographic_match if self.forensic_skipped else self.forensic_match
+        )
+        return self.cryptographic_match and forensic_ok
 
     @staticmethod
     def _format_bytes(byte_count: int) -> str:
@@ -243,6 +247,8 @@ class VerificationResult:
         else:
             lines.append("\n[3/3] Identity Link (Signature)")
             lines.append("  ⊘ No signature present")
+            if self.signature_required:
+                lines.append("  ✗ Signature required by policy")
 
         return "\n".join(lines)
 
@@ -255,7 +261,7 @@ class ArtifactVerifier:
         try:
             self.repo = AletheiaRepository(repo_root, auto_init=False)
         except RepositoryNotInitializedError as e:
-            print(f"Error: {e}", file=sys.stderr)
+            logger.error("Repository initialization failed: %s", e)
             raise
 
         self.scanner = OdinScanner()
@@ -273,6 +279,7 @@ class ArtifactVerifier:
         file_path: str,
         verbose: bool = True,
         enable_zoom: bool = True,
+        require_signature: bool = False,
         trusted_keys: Optional[Dict[str, str]] = None,
     ) -> VerificationResult:
         """
@@ -283,12 +290,14 @@ class ArtifactVerifier:
             file_path: Path to the file to verify
             verbose: Print progress info
             enable_zoom: Enable zoom scan on forensic mismatch
+            require_signature: Require valid identity signature
             trusted_keys: Optional dict of key_id -> public_key_b64 for signature verification
 
         Returns:
             VerificationResult with cryptographic and forensic verification status
         """
         result = VerificationResult()
+        result.signature_required = require_signature
 
         # Load artifact record
         record_path = self.repo.records_dir / f"{artifact_id}.json"
@@ -298,7 +307,12 @@ class ArtifactVerifier:
 
         try:
             with open(record_path, "r") as f:
-                record = json.load(f)
+                raw_record = json.load(f)
+            record = ArtifactRecord.from_dict(raw_record)
+            normalized_record = record.to_dict()
+        except SchemaValidationError as e:
+            result.error = f"Invalid artifact record schema: {e}"
+            return result
         except Exception as e:
             result.error = f"Failed to load artifact record: {e}"
             return result
@@ -310,18 +324,18 @@ class ArtifactVerifier:
             return result
 
         if verbose:
-            print(f"\n=== Verifying: {file_path_obj.name} ===")
-            print(f"Artifact ID: {artifact_id}\n")
+            logger.info("=== Verifying: %s ===", file_path_obj.name)
+            logger.info("Artifact ID: %s", artifact_id)
 
         # Step 1: Cryptographic verification
         if verbose:
-            print("[1/2] Cryptographic identity check...")
+            logger.info("[1/2] Cryptographic identity check...")
 
         # Use shared utility - DRY principle
         file_hash, file_size = compute_file_hash(file_path_obj)
 
         result.content_hash_actual = file_hash
-        result.content_hash_expected = record["content_object_id"]
+        result.content_hash_expected = record.content_object_id
         result.cryptographic_match = (
             result.content_hash_actual == result.content_hash_expected
         )
@@ -329,63 +343,67 @@ class ArtifactVerifier:
         if verbose:
             status = "✓ PASS" if result.cryptographic_match else "✗ FAIL"
             size_mb = file_size / (1024 * 1024)
-            print(f"  {status}: Content hash ({file_size:,} bytes, {size_mb:.2f} MB)")
+            logger.info(
+                "  %s: Content hash (%s bytes, %.2f MB)",
+                status,
+                f"{file_size:,}",
+                size_mb,
+            )
 
         # Step 2: Forensic verification (barcode)
         if verbose:
-            print("\n[2/2] Forensic identity check (barcode)...")
+            logger.info("[2/2] Forensic identity check (barcode)...")
 
         try:
-            # Extract scan parameters from record (with legacy fallback)
-            scan_params = record.get("scan_params", {})
-
-            # Canonical keys use _bytes suffix; legacy keys don't
-            window_size = scan_params.get(
-                "window_size_bytes", scan_params.get("window_size", 65536)
-            )
-            step_size = scan_params.get(
-                "step_size_bytes", scan_params.get("step_size", 16384)
-            )
-            m = scan_params.get("m_block_size", 1)
-            stored_format_version = scan_params.get("format_version", 1)
+            scan_params = record.scan_params
+            window_size = scan_params.window_size_bytes
+            step_size = scan_params.step_size_bytes
+            m = scan_params.m_block_size
+            stored_format_version = scan_params.format_version
 
             if verbose:
-                print(
-                    f"  Scan params: window={window_size}, step={step_size}, m={m}, format=v{stored_format_version}"
+                logger.info(
+                    "  Scan params: window=%s, step=%s, m=%s, format=v%s",
+                    window_size,
+                    step_size,
+                    m,
+                    stored_format_version,
                 )
 
             # Re-scan with MATCHING format version
-            albc_bytes, temp_path = self.scanner.scan(
-                file_path,
-                window_size=window_size,
-                step_size=step_size,
-                m=m,
-                threads=0,
-                verbose=False,
-                output_format=stored_format_version,
-            )
-
-            # Clean up temp file
+            temp_path: Optional[str] = None
             try:
-                Path(temp_path).unlink()
-            except OSError:
-                pass
+                albc_bytes, temp_path = self.scanner.scan(
+                    file_path,
+                    window_size=window_size,
+                    step_size=step_size,
+                    m=m,
+                    threads=0,
+                    verbose=False,
+                    output_format=stored_format_version,
+                )
+            finally:
+                if temp_path:
+                    try:
+                        Path(temp_path).unlink()
+                    except OSError:
+                        pass
 
             # Compare barcode hash
             result.barcode_hash_actual = hashlib.sha256(albc_bytes).hexdigest()
-            result.barcode_hash_expected = record.get("barcode_object_id", "")
+            result.barcode_hash_expected = record.barcode_object_id
             result.forensic_match = (
                 result.barcode_hash_actual == result.barcode_hash_expected
             )
 
             if verbose:
                 status = "✓ PASS" if result.forensic_match else "✗ FAIL"
-                print(f"  {status}: Barcode hash")
+                logger.info("  %s: Barcode hash", status)
 
             # Coarse localization if barcode mismatch
             if not result.forensic_match:
                 if verbose:
-                    print("\n[Coarse Localization] Analyzing modified regions...")
+                    logger.info("[Coarse Localization] Analyzing modified regions...")
 
                 # Load stored barcode from object store
                 stored_albc = self.repo.get_object_bytes(
@@ -406,16 +424,15 @@ class ArtifactVerifier:
                         )
 
                         if verbose and result.localization:
-                            print(
-                                f"  Found {len(result.localization)} modified region(s)"
+                            logger.info(
+                                "  Found %s modified region(s)",
+                                len(result.localization),
                             )
 
                         # Step 3: Zoom scan if enabled and we have coarse regions
                         if enable_zoom and result.localization:
                             if verbose:
-                                print(
-                                    "\n[Zoom Scan] Performing high-resolution analysis..."
-                                )
+                                logger.info("[Zoom Scan] Performing high-resolution analysis...")
 
                             self._perform_zoom_scan(
                                 result,
@@ -432,17 +449,17 @@ class ArtifactVerifier:
             return result
 
         # NEW: Step 3 - Verify signature if present
-        identity_link = record.get("identity_link")
+        identity_link = record.identity_link
         if identity_link:
             result.signature_present = True
 
             if verbose:
-                print("\n[3/3] Identity link verification...")
+                logger.info("[3/3] Identity link verification...")
 
             if self.identity:
                 sig_result = self.identity.verify_signature(
-                    record,
-                    identity_link,
+                    normalized_record,
+                    identity_link.to_dict(),
                     trusted_keys=trusted_keys,
                 )
 
@@ -454,11 +471,14 @@ class ArtifactVerifier:
 
                 if verbose:
                     status = "✓ PASS" if result.signature_valid else "✗ FAIL"
-                    print(f"  {status}: Signature verification")
+                    logger.info("  %s: Signature verification", status)
             else:
                 result.signature_error = "Identity system not available"
                 if verbose:
-                    print("  ⚠ Cannot verify: Identity system not available")
+                    logger.warning("  Cannot verify: Identity system not available")
+
+        if require_signature and not result.signature_present:
+            result.signature_error = "Signature required but artifact is unsigned"
 
         return result
 
@@ -466,7 +486,7 @@ class ArtifactVerifier:
         self,
         result: VerificationResult,
         suspect_file_path: str,
-        record: Dict[str, Any],
+        record: ArtifactRecord,
         coarse_window_size: int,
         coarse_step_size: int,
         m: int,
@@ -485,7 +505,7 @@ class ArtifactVerifier:
         result.zoom_performed = True
 
         # Get baseline content object PATH (not bytes!) - avoid RAM issues
-        baseline_object_id = record["content_object_id"]
+        baseline_object_id = record.content_object_id
         baseline_path = self.repo.get_object_path(baseline_object_id)
 
         if not baseline_path:
@@ -493,7 +513,7 @@ class ArtifactVerifier:
                 f"Cannot perform zoom scan: baseline object not found: {baseline_object_id}"
             )
             if verbose:
-                print("  Warning: Cannot perform zoom scan - baseline object not found")
+                logger.warning("  Cannot perform zoom scan - baseline object not found")
             return
 
         try:
@@ -531,9 +551,11 @@ class ArtifactVerifier:
                 zoom_region.zoom_end_byte = zoom_end
 
                 if verbose:
-                    print(
-                        f"  Zooming into region: bytes {zoom_start:,}-{zoom_end:,} "
-                        f"({self._format_file_size(zoom_end - zoom_start)})"
+                    logger.info(
+                        "  Zooming into region: bytes %s-%s (%s)",
+                        f"{zoom_start:,}",
+                        f"{zoom_end:,}",
+                        self._format_file_size(zoom_end - zoom_start),
                     )
 
                 # FIX #3: Use seeking instead of streaming from byte 0
@@ -542,6 +564,8 @@ class ArtifactVerifier:
                 # - Seeking: Instant teleportation
 
                 # Scan baseline at zoom resolution using byte range
+                baseline_temp: Optional[str] = None
+                suspect_temp: Optional[str] = None
                 try:
                     baseline_albc, baseline_temp = self.scanner.scan(
                         str(baseline_path),
@@ -566,63 +590,67 @@ class ArtifactVerifier:
                         end_byte=zoom_end,
                     )
 
-                    # Clean up temp files
-                    for temp_path in [baseline_temp, suspect_temp]:
-                        try:
-                            Path(temp_path).unlink()
-                        except OSError:
-                            pass
-
                     # Parse and compare zoom barcodes
-                    baseline_parsed = self.parser.parse_full(baseline_albc)
-                    suspect_parsed = self.parser.parse_full(suspect_albc)
+                    baseline_parsed = self.parser.parse_full_with_raw(baseline_albc)
+                    suspect_parsed = self.parser.parse_full_with_raw(suspect_albc)
 
                     if baseline_parsed and suspect_parsed:
-                        # Compare barcodes to find fine-grained differences
-                        baseline_bc = baseline_parsed.get("barcode_payload", b"")
-                        suspect_bc = suspect_parsed.get("barcode_payload", b"")
+                        fine_regions: List[Tuple[int, int, int, int]] = []
 
-                        # Find differing windows
-                        fine_regions = []
-                        num_windows = min(len(baseline_bc), len(suspect_bc))
+                        baseline_raw = baseline_parsed.get("raw_entropy")
+                        suspect_raw = suspect_parsed.get("raw_entropy")
+                        if (
+                            isinstance(baseline_raw, list)
+                            and isinstance(suspect_raw, list)
+                            and len(baseline_raw) == len(suspect_raw)
+                            and len(baseline_raw) > 0
+                        ):
+                            fine_regions = self.parser.compare_barcodes_raw(
+                                baseline_raw,
+                                suspect_raw,
+                                ZOOM_WINDOW_SIZE,
+                                ZOOM_STEP_SIZE,
+                                threshold=ZOOM_RAW_THRESHOLD,
+                            )
+                        else:
+                            baseline_bc = baseline_parsed.get("barcode_payload", b"")
+                            suspect_bc = suspect_parsed.get("barcode_payload", b"")
+                            num_windows = min(len(baseline_bc), len(suspect_bc))
 
-                        in_diff = False
-                        diff_start_win = 0
+                            in_diff = False
+                            diff_start_win = 0
 
-                        for win_idx in range(num_windows):
-                            if baseline_bc[win_idx] != suspect_bc[win_idx]:
-                                if not in_diff:
-                                    in_diff = True
-                                    diff_start_win = win_idx
-                            else:
-                                if in_diff:
-                                    # End of difference region
-                                    # Store RELATIVE byte offsets (relative to zoom_start_byte)
-                                    # format_report() will add zoom_start_byte when displaying
+                            for win_idx in range(num_windows):
+                                if baseline_bc[win_idx] != suspect_bc[win_idx]:
+                                    if not in_diff:
+                                        in_diff = True
+                                        diff_start_win = win_idx
+                                elif in_diff:
+                                    # End window is inclusive.
+                                    end_win = win_idx - 1
                                     start_byte = diff_start_win * ZOOM_STEP_SIZE
-                                    end_byte = (
-                                        win_idx * ZOOM_STEP_SIZE + ZOOM_WINDOW_SIZE
-                                    )
+                                    end_byte = end_win * ZOOM_STEP_SIZE + ZOOM_WINDOW_SIZE
                                     fine_regions.append(
-                                        (diff_start_win, win_idx, start_byte, end_byte)
+                                        (diff_start_win, end_win, start_byte, end_byte)
                                     )
                                     in_diff = False
 
-                        # Handle difference extending to end
-                        if in_diff:
-                            # Store RELATIVE byte offsets
-                            start_byte = diff_start_win * ZOOM_STEP_SIZE
-                            end_byte = num_windows * ZOOM_STEP_SIZE + ZOOM_WINDOW_SIZE
-                            fine_regions.append(
-                                (diff_start_win, num_windows, start_byte, end_byte)
-                            )
+                            # Handle difference extending to end.
+                            if in_diff and num_windows > 0:
+                                end_win = num_windows - 1
+                                start_byte = diff_start_win * ZOOM_STEP_SIZE
+                                end_byte = end_win * ZOOM_STEP_SIZE + ZOOM_WINDOW_SIZE
+                                fine_regions.append(
+                                    (diff_start_win, end_win, start_byte, end_byte)
+                                )
 
                         zoom_region.fine_regions = fine_regions
 
                         if verbose:
                             if fine_regions:
-                                print(
-                                    f"    Found {len(fine_regions)} fine-grained difference(s)"
+                                logger.info(
+                                    "    Found %s fine-grained difference(s)",
+                                    len(fine_regions),
                                 )
                                 for (
                                     start_win,
@@ -633,24 +661,35 @@ class ArtifactVerifier:
                                     # Add zoom_start_byte for absolute display
                                     abs_start = zoom_region.zoom_start_byte + start_byte
                                     abs_end = zoom_region.zoom_start_byte + end_byte
-                                    print(
-                                        f"      Windows {start_win}-{end_win}: bytes {abs_start:,}-{abs_end:,}"
+                                    logger.info(
+                                        "      Windows %s-%s: bytes %s-%s",
+                                        start_win,
+                                        end_win,
+                                        f"{abs_start:,}",
+                                        f"{abs_end:,}",
                                     )
                                 if len(fine_regions) > 3:
-                                    print(f"      ... and {len(fine_regions) - 3} more")
+                                    logger.info("      ... and %s more", len(fine_regions) - 3)
                             else:
-                                print(f"    No fine-grained differences detected")
+                                logger.info("    No fine-grained differences detected")
 
                 except Exception as e:
                     if verbose:
-                        print(f"    ⚠ Zoom scan failed for this region: {e}")
+                        logger.warning("    Zoom scan failed for this region: %s", e)
+                finally:
+                    for temp_path in (baseline_temp, suspect_temp):
+                        if temp_path:
+                            try:
+                                Path(temp_path).unlink()
+                            except OSError:
+                                pass
 
                 result.zoom_regions.append(zoom_region)
 
         except Exception as e:
             result.warnings.append(f"Zoom scan error: {e}")
             if verbose:
-                print(f"  Warning: Zoom scan encountered error: {e}")
+                logger.warning("  Zoom scan encountered error: %s", e)
 
     @staticmethod
     def _format_file_size(byte_count: int) -> str:
@@ -665,73 +704,3 @@ class ArtifactVerifier:
             return f"{byte_count / (1024 * 1024 * 1024):.2f} GB"
 
 
-def main():
-    """CLI entry point for verification."""
-    if len(sys.argv) < 3:
-        print(
-            "Usage: python verify.py <artifact_id> --file <path> [options]",
-            file=sys.stderr,
-        )
-        print("\nOptions:", file=sys.stderr)
-        print("  --repo <path>    Repository root (default: .)", file=sys.stderr)
-        print("  --quiet          Suppress verbose output", file=sys.stderr)
-        print(
-            "  --no-zoom        Disable zoom scan (only coarse localization)",
-            file=sys.stderr,
-        )
-        sys.exit(2)
-
-    artifact_id = sys.argv[1]
-    file_path = None
-    repo_root = "."
-    verbose = True
-    enable_zoom = True
-
-    i = 2
-    while i < len(sys.argv):
-        arg = sys.argv[i]
-        if arg == "--file" and i + 1 < len(sys.argv):
-            file_path = sys.argv[i + 1]
-            i += 2
-        elif arg == "--repo" and i + 1 < len(sys.argv):
-            repo_root = sys.argv[i + 1]
-            i += 2
-        elif arg == "--quiet":
-            verbose = False
-            i += 1
-        elif arg == "--no-zoom":
-            enable_zoom = False
-            i += 1
-        else:
-            print(f"Unknown argument: {arg}", file=sys.stderr)
-            sys.exit(2)
-
-    if not file_path:
-        print("Error: --file <path> is required", file=sys.stderr)
-        sys.exit(2)
-
-    try:
-        verifier = ArtifactVerifier(repo_root=repo_root)
-        result = verifier.verify(
-            artifact_id, file_path, verbose=verbose, enable_zoom=enable_zoom
-        )
-
-        if verbose:
-            print()
-
-        print(result.format_report(verbose=verbose))
-
-        sys.exit(0 if result.passed() else 1)
-
-    except RepositoryNotInitializedError:
-        sys.exit(1)
-    except Exception as e:
-        print(f"Error: {e}", file=sys.stderr)
-        import traceback
-
-        traceback.print_exc()
-        sys.exit(1)
-
-
-if __name__ == "__main__":
-    main()

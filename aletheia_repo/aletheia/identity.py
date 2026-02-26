@@ -1,4 +1,3 @@
-#!/usr/bin/env python3
 """
 Aletheia Identity Link - Digital Signatures for Artifact Records
 
@@ -19,10 +18,12 @@ import base64
 import hashlib
 import json
 import os
-import sys
+import re
 from datetime import datetime
 from pathlib import Path
 from typing import Dict, Any, Optional, Tuple, List
+
+from .domain import ArtifactRecord, IdentitySignature, ScanParams
 
 # Use cryptography library (widely available, audited)
 try:
@@ -44,6 +45,16 @@ except ImportError:
 DEFAULT_KEY_DIR = Path.home() / ".aletheia" / "keys"
 KEY_FILE_EXTENSION = ".key"
 PUBKEY_FILE_EXTENSION = ".pub"
+KEY_ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$")
+LEGACY_FINGERPRINT_LEN = 16
+
+
+def validate_key_id(key_id: str) -> None:
+    """Validate safe key identifiers for on-disk key storage."""
+    if not isinstance(key_id, str) or not KEY_ID_RE.fullmatch(key_id):
+        raise IdentityError(
+            "Invalid key_id. Use 1-64 chars: letters, numbers, '.', '_' or '-'; must start with alphanumeric."
+        )
 
 
 class IdentityError(Exception):
@@ -116,6 +127,7 @@ class IdentityLink:
         Raises:
             IdentityError: If key_id already exists
         """
+        validate_key_id(key_id)
         private_key_path = self.key_dir / f"{key_id}{KEY_FILE_EXTENSION}"
         public_key_path = self.key_dir / f"{key_id}{PUBKEY_FILE_EXTENSION}"
 
@@ -132,8 +144,8 @@ class IdentityLink:
         )
         public_key_b64 = base64.b64encode(public_key_bytes).decode("ascii")
 
-        # Compute fingerprint (SHA-256 of public key, truncated)
-        fingerprint = hashlib.sha256(public_key_bytes).hexdigest()[:16]
+        # Compute fingerprint (SHA-256 of public key, full hex)
+        fingerprint = hashlib.sha256(public_key_bytes).hexdigest()
 
         # Serialize private key (encrypted if passphrase provided)
         if passphrase:
@@ -220,6 +232,8 @@ class IdentityLink:
 
         Returns dict with public_key_b64, fingerprint, metadata.
         """
+        validate_key_id(key_id)
+
         # Try public key file first
         public_key_path = self.key_dir / f"{key_id}{PUBKEY_FILE_EXTENSION}"
         if public_key_path.exists():
@@ -249,6 +263,7 @@ class IdentityLink:
         self, key_id: str, passphrase: Optional[str] = None
     ) -> Tuple[Ed25519PrivateKey, Dict[str, Any]]:
         """Load private key from file."""
+        validate_key_id(key_id)
         key_path = self.key_dir / f"{key_id}{KEY_FILE_EXTENSION}"
 
         if not key_path.exists():
@@ -299,6 +314,8 @@ class IdentityLink:
                 "signed_fields": ["content_object_id", "barcode_object_id", ...]
             }
         """
+        record_obj = ArtifactRecord.from_dict(record)
+
         # Load private key
         private_key, key_content = self._load_private_key(key_id, passphrase)
 
@@ -312,7 +329,7 @@ class IdentityLink:
             "created_at_unix_ms",
         ]
 
-        canonical_data = self._build_canonical_message(record, signed_fields)
+        canonical_data = self._build_canonical_message(record_obj.to_dict(), signed_fields)
 
         # Sign
         signature_bytes = private_key.sign(canonical_data)
@@ -320,14 +337,15 @@ class IdentityLink:
 
         signed_at = datetime.utcnow().isoformat() + "Z"
 
-        return {
-            "signature_version": self.SIGNATURE_VERSION,
-            "key_id": key_id,
-            "fingerprint": key_content["fingerprint"],
-            "signed_at": signed_at,
-            "signature_b64": signature_b64,
-            "signed_fields": signed_fields,
-        }
+        signature = IdentitySignature(
+            signature_version=self.SIGNATURE_VERSION,
+            key_id=key_id,
+            fingerprint=key_content["fingerprint"],
+            signed_at=signed_at,
+            signature_b64=signature_b64,
+            signed_fields=signed_fields,
+        )
+        return signature.to_dict()
 
     def _build_canonical_message(
         self, record: Dict[str, Any], fields: List[str]
@@ -380,17 +398,29 @@ class IdentityLink:
                 "error": None or "error message"
             }
         """
+        try:
+            record_obj = ArtifactRecord.from_dict(record)
+            signature = IdentitySignature.from_dict(signature_block)
+        except Exception as e:
+            return {
+                "valid": False,
+                "key_id": signature_block.get("key_id"),
+                "fingerprint": signature_block.get("fingerprint"),
+                "signed_at": signature_block.get("signed_at"),
+                "error": f"Invalid signature payload: {e}",
+            }
+
         result = {
             "valid": False,
-            "key_id": signature_block.get("key_id"),
-            "fingerprint": signature_block.get("fingerprint"),
-            "signed_at": signature_block.get("signed_at"),
+            "key_id": signature.key_id,
+            "fingerprint": signature.fingerprint,
+            "signed_at": signature.signed_at,
             "error": None,
         }
 
         try:
             # Get public key
-            key_id = signature_block.get("key_id")
+            key_id = signature.key_id
             if not key_id:
                 result["error"] = "Missing key_id in signature"
                 return result
@@ -410,18 +440,20 @@ class IdentityLink:
             public_key_bytes = base64.b64decode(public_key_b64)
             public_key = Ed25519PublicKey.from_public_bytes(public_key_bytes)
 
-            # Verify fingerprint matches
-            expected_fingerprint = hashlib.sha256(public_key_bytes).hexdigest()[:16]
-            if signature_block.get("fingerprint") != expected_fingerprint:
+            # Verify fingerprint matches (accept full or legacy 16-char values)
+            expected_fingerprint = hashlib.sha256(public_key_bytes).hexdigest()
+            legacy_fingerprint = expected_fingerprint[:LEGACY_FINGERPRINT_LEN]
+            signature_fingerprint = signature.fingerprint
+            if signature_fingerprint not in {expected_fingerprint, legacy_fingerprint}:
                 result["error"] = "Fingerprint mismatch"
                 return result
 
             # Rebuild canonical message
-            signed_fields = signature_block.get("signed_fields", [])
-            canonical_data = self._build_canonical_message(record, signed_fields)
+            signed_fields = signature.signed_fields
+            canonical_data = self._build_canonical_message(record_obj.to_dict(), signed_fields)
 
             # Decode signature
-            signature_b64 = signature_block.get("signature_b64")
+            signature_b64 = signature.signature_b64
             if not signature_b64:
                 result["error"] = "Missing signature"
                 return result
@@ -444,6 +476,7 @@ class IdentityLink:
 
     def export_public_key(self, key_id: str) -> str:
         """Export public key as JSON string for distribution."""
+        validate_key_id(key_id)
         key_info = self.get_public_key(key_id)
         return json.dumps(key_info, indent=2)
 
@@ -458,6 +491,7 @@ class IdentityLink:
         key_id = key_info.get("key_id")
         if not key_id:
             raise IdentityError("Invalid key file: missing key_id")
+        validate_key_id(key_id)
 
         # Validate it's a public key
         if "private_key_pem" in key_info:
@@ -466,9 +500,41 @@ class IdentityLink:
         if "public_key_b64" not in key_info:
             raise IdentityError("Invalid key file: missing public_key_b64")
 
+        algorithm = key_info.get("algorithm", "Ed25519")
+        if algorithm != "Ed25519":
+            raise IdentityError(f"Unsupported public key algorithm: {algorithm}")
+
+        try:
+            public_key_bytes = base64.b64decode(key_info["public_key_b64"], validate=True)
+            if len(public_key_bytes) != 32:
+                raise IdentityError("Invalid public key length for Ed25519")
+            Ed25519PublicKey.from_public_bytes(public_key_bytes)
+        except Exception as e:
+            if isinstance(e, IdentityError):
+                raise
+            raise IdentityError(f"Invalid public key encoding: {e}")
+
+        expected_fingerprint = hashlib.sha256(public_key_bytes).hexdigest()
+        provided_fingerprint = key_info.get("fingerprint")
+        if provided_fingerprint and provided_fingerprint not in {
+            expected_fingerprint,
+            expected_fingerprint[:LEGACY_FINGERPRINT_LEN],
+        }:
+            raise IdentityError("Fingerprint does not match provided public key")
+
+        normalized_key_info = {
+            "version": key_info.get("version", "aletheia/pubkey/1"),
+            "key_id": key_id,
+            "algorithm": "Ed25519",
+            "fingerprint": expected_fingerprint,
+            "public_key_b64": key_info["public_key_b64"],
+            "created_at": key_info.get("created_at", datetime.utcnow().isoformat() + "Z"),
+            "metadata": key_info.get("metadata", {}),
+        }
+
         # Write to key directory
         public_key_path = self.key_dir / f"{key_id}{PUBKEY_FILE_EXTENSION}"
-        public_key_path.write_text(json.dumps(key_info, indent=2))
+        public_key_path.write_text(json.dumps(normalized_key_info, indent=2))
 
         return key_id
 
@@ -488,22 +554,27 @@ def build_signed_artifact_record(
 
     Convenience function combining ArtifactRecordBuilder + signing.
     """
-    from ingest import ArtifactRecordBuilder
-
     # Build base record
-    record = ArtifactRecordBuilder.build(
+    record = ArtifactRecord(
         content_object_id=content_object_id,
         barcode_object_id=barcode_object_id,
-        scan_params=scan_params,
+        scan_params=ScanParams.from_dict(scan_params),
         created_at_unix_ms=created_at_unix_ms,
-        original_filename=original_filename,
+        metadata=ArtifactRecord.default_metadata(original_filename),
     )
 
     # Sign it
     identity = IdentityLink(key_dir=key_dir)
-    signature_block = identity.sign_artifact_record(record, key_id, passphrase)
+    signature_block = identity.sign_artifact_record(record.to_dict(), key_id, passphrase)
 
     # Add signature to record
-    record["identity_link"] = signature_block
-
-    return record
+    signature = IdentitySignature.from_dict(signature_block)
+    return ArtifactRecord(
+        content_object_id=record.content_object_id,
+        barcode_object_id=record.barcode_object_id,
+        scan_params=record.scan_params,
+        created_at_unix_ms=record.created_at_unix_ms,
+        metadata=record.metadata,
+        record_version=record.record_version,
+        identity_link=signature,
+    ).to_dict()
