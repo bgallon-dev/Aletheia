@@ -441,7 +441,7 @@ The client never writes unverified data. The Merkle root was established at inge
 
 | File                                | Changes                                                                         |
 | ----------------------------------- | ------------------------------------------------------------------------------- |
-| `entropy/odin_entropy/entropy.odin` | Added ALBC0002 format, `--high-precision` flag, `write_barcode_file_extended()` |
-| `alethaia_repo/utils.py`            | Extended `ALBCParser` to handle ALBC0002, added `compare_barcodes_raw()`        |
-| `alethaia_repo/ingest.py`           | Added `high_precision` parameter to `OdinScanner.scan()`                        |
-| `alethaia_repo/verify.py`           | Zoom scan now uses high-precision mode and raw f64 comparison                   |
+| `odin_entropy/entropy.odin`         | Added ALBC0002 format, `--high-precision` flag, `write_barcode_file_extended()` |
+| `aletheia/utils.py`                 | Extended `ALBCParser` to handle ALBC0002, added `compare_barcodes_raw()`        |
+| `aletheia/ingest.py`                | Added `high_precision` parameter to `OdinScanner.scan()`                        |
+| `aletheia/verify.py`                | Zoom scan now uses high-precision mode and raw f64 comparison                   |

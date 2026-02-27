@@ -208,19 +208,12 @@ __marimo__/
 
 
 odin_entropy/entropy.exe
-entropy/odin_entropy/entropy.exe
 applsci-14-06297-v2.pdf
-
-
-\objects
-\records
-\tmp
-
-index.sqlite3
-config.json
 applsci_corrupt.pdf
 
-.gitignore
-alethaia_repo/ARCHITECTURE_ANALYSIS.md
-aletheia_repo/PORTFOLIO_DEMO.md
-.gitignore
+# Runtime repository data
+objects/
+records/
+tmp/
+index.sqlite3
+config.json

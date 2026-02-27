@@ -1,0 +1,11 @@
+# Runtime repository data
+objects/
+records/
+tmp/
+index.sqlite3
+config.json
+
+# Python caches
+__pycache__/
+*.py[cod]
+.pytest_cache/

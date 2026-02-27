@@ -441,6 +441,10 @@ class OdinScanner:
         candidates = [
             "entropy",
             "entropy.exe",
+            "odin_entropy/entropy",
+            "odin_entropy/entropy.exe",
+            "../odin_entropy/entropy",
+            "../odin_entropy/entropy.exe",
             "../entropy/odin_entropy/entropy",
             "../entropy/odin_entropy/entropy.exe",
             "../../entropy/odin_entropy/entropy",

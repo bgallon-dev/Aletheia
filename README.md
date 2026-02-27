@@ -17,7 +17,7 @@ Aletheia provides cryptographic and forensic verification of files through:
 pip install -e .
 
 # 2. Compile the Odin entropy scanner
-odin build entropy.odin -file -o:speed -out:entropy.exe
+odin build odin_entropy/entropy.odin -file -o:speed -out:odin_entropy/entropy.exe
 
 # 3. (Optional) Install cryptography for digital signatures
 pip install cryptography
@@ -360,7 +360,7 @@ JSON records link content + barcode + metadata + optional signature:
 ### Directory Structure
 
 ```
-alethaia_repo/
+repo-root/
 ├── objects/          # Content-addressed objects (2-char fanout)
 │   ├── a1/a1b2...    # Content files
 │   └── cd/cdef...    # Barcode files
