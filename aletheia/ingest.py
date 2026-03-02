@@ -26,6 +26,7 @@ from typing import Dict, Any, Optional, Tuple, List, Union
 from shutil import which
 from .utils import hash_and_copy_file
 
+from .algorithms import ARTIFACT_ID_PREFIX, ALGO_BARCODE_V1
 from .domain import ArtifactRecord, ScanParams
 from .repository import AletheiaRepository, RepositoryNotInitializedError
 
@@ -408,7 +409,7 @@ class ArtifactRecordBuilder:
 
         Formula: SHA-256("ALETHEIA_AR_V1" || content_object_id || barcode_object_id)
         """
-        prefix = b"ALETHEIA_AR_V1"
+        prefix = ARTIFACT_ID_PREFIX
         content_bytes = bytes.fromhex(content_object_id)
         barcode_bytes = bytes.fromhex(barcode_object_id)
 
@@ -437,7 +438,9 @@ class OdinScanner:
 
     def _find_binary(self) -> str:
         """Locate the Odin entropy scanner binary."""
-        # Check common locations
+        env_path = os.environ.get("ODIN_BINARY")
+        if env_path and self._check_binary(env_path):
+            return env_path
         candidates = [
             "entropy",
             "entropy.exe",
@@ -824,7 +827,7 @@ class IngestPipeline:
             if header is None:
                 raise ValueError("Failed to parse ALBC header")
 
-            scan_params = ScanParams.from_albc_header(header)
+            scan_params = ScanParams.from_albc_header(header, algo_version=ALGO_BARCODE_V1)
 
             if verbose:
                 logger.info(

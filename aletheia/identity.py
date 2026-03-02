@@ -142,6 +142,9 @@ class IdentityLink:
         public_key_bytes = public_key.public_bytes(
             encoding=serialization.Encoding.Raw, format=serialization.PublicFormat.Raw
         )
+        assert len(public_key_bytes) == 32, (
+            f"Ed25519 public key must be 32 bytes, got {len(public_key_bytes)}"
+        )
         public_key_b64 = base64.b64encode(public_key_bytes).decode("ascii")
 
         # Compute fingerprint (SHA-256 of public key, full hex)
@@ -333,6 +336,9 @@ class IdentityLink:
 
         # Sign
         signature_bytes = private_key.sign(canonical_data)
+        assert len(signature_bytes) == 64, (
+            f"Ed25519 signature must be 64 bytes, got {len(signature_bytes)}"
+        )
         signature_b64 = base64.b64encode(signature_bytes).decode("ascii")
 
         signed_at = datetime.utcnow().isoformat() + "Z"
@@ -438,6 +444,9 @@ class IdentityLink:
 
             # Decode public key
             public_key_bytes = base64.b64decode(public_key_b64)
+            assert len(public_key_bytes) == 32, (
+                f"Ed25519 public key must be 32 bytes, got {len(public_key_bytes)}"
+            )
             public_key = Ed25519PublicKey.from_public_bytes(public_key_bytes)
 
             # Verify fingerprint matches (accept full or legacy 16-char values)

@@ -292,7 +292,7 @@ class AletheiaRepository:
                         tmp_path.unlink(missing_ok=True)
                     else:
                         raise
-            except:
+            except Exception:
                 tmp_path.unlink(missing_ok=True)
                 raise
 
@@ -343,6 +343,10 @@ class AletheiaRepository:
                         pass  # That's fine, content is identical (content-addressed)
                     else:
                         raise
+
+            assert obj_path.exists(), (
+                f"Atomic move failed: object {object_id} not found at {obj_path}"
+            )
 
             # Index the object
             conn = self._connect()
@@ -922,6 +926,48 @@ class AletheiaRepository:
             if tmp_record_path.exists():
                 tmp_record_path.unlink(missing_ok=True)
 
+    def update_artifact_identity_link(
+        self,
+        artifact_id: str,
+        sig_block_dict: Dict[str, Any],
+        allow_overwrite: bool = False,
+    ) -> None:
+        """Patch only the identity_link field of an existing artifact record.
+
+        This is the only sanctioned mutation of a stored record; all other fields
+        remain immutable.
+
+        Raises:
+            FileNotFoundError: Artifact does not exist.
+            ImmutabilityError: Already signed and allow_overwrite=False.
+            SchemaValidationError: sig_block_dict is malformed.
+        """
+        from .domain import IdentitySignature
+        import dataclasses
+
+        record_path = self.records_dir / f"{artifact_id}.json"
+        if not record_path.exists():
+            raise FileNotFoundError(f"Artifact record not found: {artifact_id}")
+
+        with open(record_path, "r") as f:
+            raw = json.load(f)
+        record = ArtifactRecord.from_dict(raw)
+
+        if record.identity_link is not None and not allow_overwrite:
+            raise ImmutabilityError(
+                f"{artifact_id}: already signed; pass allow_overwrite=True to replace"
+            )
+
+        sig = IdentitySignature.from_dict(sig_block_dict)
+        updated = dataclasses.replace(record, identity_link=sig)
+
+        tmp_path = self.tmp_dir / f"record.{artifact_id}.{uuid.uuid4().hex}.tmp"
+        try:
+            tmp_path.write_text(json.dumps(updated.to_dict(), indent=2))
+            os.replace(str(tmp_path), str(record_path))
+        finally:
+            tmp_path.unlink(missing_ok=True)
+
     def ensure_artifact_indexed(
         self,
         artifact_id: str,
@@ -1017,6 +1063,9 @@ class AletheiaRepository:
                 scan_params.m_block_size,
                 scan_params.quant_version,
                 scan_params.barcode_len,
+            )
+            assert len(row_values) == 10, (
+                f"row_values has {len(row_values)} fields; expected 10 to match artifacts schema"
             )
 
             cursor.execute(

@@ -5,18 +5,57 @@ on:
   pull_request:
 
 jobs:
-  unit:
+  security:
     runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Install dependencies
+        run: pip install uv && uv sync --extra dev
+      - name: Dependency vulnerability scan
+        run: pip-audit
+      - name: Static security analysis
+        run: bandit -r aletheia/ -c pyproject.toml
+
+  lint:
+    needs: security
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Install dependencies
+        run: pip install uv && uv sync --extra dev
+      - name: Ruff lint
+        run: ruff check aletheia/ tests/
+      - name: Ruff format check
+        run: ruff format --check aletheia/ tests/
+      - name: Mypy type check
+        run: mypy aletheia/
+
+  unit:
+    needs: lint
+    runs-on: ${{ matrix.os }}
     strategy:
       fail-fast: false
       matrix:
-        python-version: ["3.8", "3.10", "3.11", "3.12"]
+        os: [ubuntu-latest, windows-latest]
+        python-version: ["3.9", "3.10", "3.11", "3.12"]
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
         with:
           python-version: ${{ matrix.python-version }}
-      - name: Install package
-        run: python -m pip install --upgrade pip && python -m pip install -e . pytest
-      - name: Run tests
-        run: python -m pytest -q
+      - name: Install dependencies
+        run: pip install uv && uv sync --extra dev
+      - name: Run tests with coverage
+        run: pytest --cov=aletheia --cov-report=term-missing --cov-report=xml -q
+      - name: Upload coverage
+        uses: codecov/codecov-action@v4
+        if: matrix.os == 'ubuntu-latest' && matrix.python-version == '3.12'
+        with:
+          files: coverage.xml
+          fail_ci_if_error: false

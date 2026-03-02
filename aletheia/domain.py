@@ -144,6 +144,7 @@ class ScanParams:
     barcode_len: int
     format_version: int = 1
     raw_data_offset: int = 0
+    algo_version: str = "barcode:v1"  # identifies the barcode algorithm; see algorithms.py
 
     @classmethod
     def from_dict(cls, payload: Mapping[str, Any]) -> "ScanParams":
@@ -164,6 +165,16 @@ class ScanParams:
             payload.get("raw_data_offset", 0), "scan_params.raw_data_offset"
         )
         quant_version = str(payload.get("quant_version", "v0"))
+        algo_version = str(payload.get("algo_version", "barcode:v1"))
+        if not (0 < step_size_bytes <= window_size_bytes):
+            raise SchemaValidationError(
+                f"scan_params.step_size_bytes ({step_size_bytes}) must be in range "
+                f"(0, window_size_bytes={window_size_bytes}]"
+            )
+        if format_version not in (1, 2):
+            raise SchemaValidationError(
+                f"scan_params.format_version must be 1 or 2, got {format_version}"
+            )
         return cls(
             window_size_bytes=window_size_bytes,
             step_size_bytes=step_size_bytes,
@@ -172,22 +183,38 @@ class ScanParams:
             barcode_len=barcode_len,
             format_version=format_version,
             raw_data_offset=raw_data_offset,
+            algo_version=algo_version,
         )
 
     @classmethod
-    def from_albc_header(cls, header: Mapping[str, Any]) -> "ScanParams":
+    def from_albc_header(
+        cls, header: Mapping[str, Any], algo_version: str = "barcode:v1"
+    ) -> "ScanParams":
+        window_size_bytes = _as_int(header.get("window_size_bytes"), "header.window_size_bytes")
+        step_size_bytes = _as_int(header.get("step_size_bytes"), "header.step_size_bytes")
+        m_block_size = _as_int(header.get("m_block_size", 1), "header.m_block_size")
+        barcode_len = _as_int(header.get("barcode_len", 0), "header.barcode_len")
+        format_version = _as_int(header.get("format_version", 1), "header.format_version")
+        raw_data_offset = _as_int(header.get("raw_data_offset", 0), "header.raw_data_offset")
+        quant_version = str(header.get("quant_version", "v0"))
+        if not (0 < step_size_bytes <= window_size_bytes):
+            raise SchemaValidationError(
+                f"header.step_size_bytes ({step_size_bytes}) must be in range "
+                f"(0, window_size_bytes={window_size_bytes}]"
+            )
+        if format_version not in (1, 2):
+            raise SchemaValidationError(
+                f"header.format_version must be 1 or 2, got {format_version}"
+            )
         return cls(
-            window_size_bytes=_as_int(
-                header.get("window_size_bytes"), "header.window_size_bytes"
-            ),
-            step_size_bytes=_as_int(header.get("step_size_bytes"), "header.step_size_bytes"),
-            m_block_size=_as_int(header.get("m_block_size", 1), "header.m_block_size"),
-            quant_version=str(header.get("quant_version", "v0")),
-            barcode_len=_as_int(header.get("barcode_len", 0), "header.barcode_len"),
-            format_version=_as_int(header.get("format_version", 1), "header.format_version"),
-            raw_data_offset=_as_int(
-                header.get("raw_data_offset", 0), "header.raw_data_offset"
-            ),
+            window_size_bytes=window_size_bytes,
+            step_size_bytes=step_size_bytes,
+            m_block_size=m_block_size,
+            quant_version=quant_version,
+            barcode_len=barcode_len,
+            format_version=format_version,
+            raw_data_offset=raw_data_offset,
+            algo_version=algo_version,
         )
 
     def to_dict(self) -> Dict[str, Any]:
@@ -199,6 +226,7 @@ class ScanParams:
             "barcode_len": self.barcode_len,
             "format_version": self.format_version,
             "raw_data_offset": self.raw_data_offset,
+            "algo_version": self.algo_version,
         }
 
 

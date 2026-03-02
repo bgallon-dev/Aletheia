@@ -82,6 +82,10 @@ def hash_and_copy_file(
             if progress_callback:
                 progress_callback(file_size)
     
+    actual_size = dst_path.stat().st_size
+    assert actual_size == file_size, (
+        f"Destination size mismatch after copy: wrote {actual_size} bytes, expected {file_size}"
+    )
     return hasher.hexdigest(), file_size
 
 

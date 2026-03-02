@@ -1,0 +1,8 @@
+{
+  "_doc": "Golden output for ArtifactRecordBuilder.derive_artifact_id. Update only when algorithm changes (bump version).",
+  "inputs": {
+    "content_object_id": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+    "barcode_object_id": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+  },
+  "expected_artifact_id": "ea0f10ff8b677f8115c25926b88d514b3999779faf443fead2ebd98ceb5b8e3b"
+}

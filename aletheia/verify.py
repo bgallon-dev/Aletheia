@@ -20,13 +20,9 @@ from .domain import ArtifactRecord, SchemaValidationError
 from .repository import AletheiaRepository, RepositoryNotInitializedError
 from .ingest import OdinScanner, ALBCParser
 from .utils import compute_file_hash
+from .algorithms import ZOOM_V1
 
-
-# Zoom scan parameters (8× finer resolution than baseline)
-ZOOM_WINDOW_SIZE = 8192  # 8 KiB
-ZOOM_STEP_SIZE = 2048  # 2 KiB
-ZOOM_MARGIN_WINDOWS = 2  # Include 2 windows before/after for context
-ZOOM_RAW_THRESHOLD = 1e-9
+# Zoom scan parameters are defined in algorithms.ZOOM_V1
 logger = logging.getLogger(__name__)
 
 try:
@@ -193,8 +189,8 @@ class VerificationResult:
         if self.zoom_performed and self.zoom_regions:
             lines.append("\n[Zoom Scan - High Resolution Localization]")
             lines.append(
-                f"  Resolution: WS={ZOOM_WINDOW_SIZE} bytes ({ZOOM_WINDOW_SIZE // 1024} KiB), "
-                f"SS={ZOOM_STEP_SIZE} bytes ({ZOOM_STEP_SIZE // 1024} KiB)"
+                f"  Resolution: WS={ZOOM_V1.window_size} bytes ({ZOOM_V1.window_size // 1024} KiB), "
+                f"SS={ZOOM_V1.step_size} bytes ({ZOOM_V1.step_size // 1024} KiB)"
             )
             lines.append(f"  Analyzed {len(self.zoom_regions)} coarse region(s)\n")
 
@@ -537,7 +533,7 @@ class ArtifactVerifier:
                 )
 
                 # Compute zoom scan bounds with margin
-                margin_bytes = ZOOM_MARGIN_WINDOWS * coarse_step_size
+                margin_bytes = ZOOM_V1.margin_windows * coarse_step_size
                 zoom_start = max(0, coarse_start_byte - margin_bytes)
                 zoom_end = min(suspect_size, coarse_end_byte + margin_bytes)
 
@@ -569,8 +565,8 @@ class ArtifactVerifier:
                 try:
                     baseline_albc, baseline_temp = self.scanner.scan(
                         str(baseline_path),
-                        window_size=ZOOM_WINDOW_SIZE,
-                        step_size=ZOOM_STEP_SIZE,
+                        window_size=ZOOM_V1.window_size,
+                        step_size=ZOOM_V1.step_size,
                         m=m,
                         threads=0,
                         verbose=False,
@@ -581,8 +577,8 @@ class ArtifactVerifier:
                     # Scan suspect at zoom resolution
                     suspect_albc, suspect_temp = self.scanner.scan(
                         suspect_file_path,
-                        window_size=ZOOM_WINDOW_SIZE,
-                        step_size=ZOOM_STEP_SIZE,
+                        window_size=ZOOM_V1.window_size,
+                        step_size=ZOOM_V1.step_size,
                         m=m,
                         threads=0,
                         verbose=False,
@@ -608,9 +604,9 @@ class ArtifactVerifier:
                             fine_regions = self.parser.compare_barcodes_raw(
                                 baseline_raw,
                                 suspect_raw,
-                                ZOOM_WINDOW_SIZE,
-                                ZOOM_STEP_SIZE,
-                                threshold=ZOOM_RAW_THRESHOLD,
+                                ZOOM_V1.window_size,
+                                ZOOM_V1.step_size,
+                                threshold=ZOOM_V1.raw_threshold,
                             )
                         else:
                             baseline_bc = baseline_parsed.get("barcode_payload", b"")
@@ -628,8 +624,8 @@ class ArtifactVerifier:
                                 elif in_diff:
                                     # End window is inclusive.
                                     end_win = win_idx - 1
-                                    start_byte = diff_start_win * ZOOM_STEP_SIZE
-                                    end_byte = end_win * ZOOM_STEP_SIZE + ZOOM_WINDOW_SIZE
+                                    start_byte = diff_start_win * ZOOM_V1.step_size
+                                    end_byte = end_win * ZOOM_V1.step_size + ZOOM_V1.window_size
                                     fine_regions.append(
                                         (diff_start_win, end_win, start_byte, end_byte)
                                     )
@@ -638,8 +634,8 @@ class ArtifactVerifier:
                             # Handle difference extending to end.
                             if in_diff and num_windows > 0:
                                 end_win = num_windows - 1
-                                start_byte = diff_start_win * ZOOM_STEP_SIZE
-                                end_byte = end_win * ZOOM_STEP_SIZE + ZOOM_WINDOW_SIZE
+                                start_byte = diff_start_win * ZOOM_V1.step_size
+                                end_byte = end_win * ZOOM_V1.step_size + ZOOM_V1.window_size
                                 fine_regions.append(
                                     (diff_start_win, end_win, start_byte, end_byte)
                                 )

@@ -1,0 +1,24 @@
+{
+  "_doc": "Golden key-set for ArtifactRecord.to_dict(). Adding/removing keys here is a breaking change.",
+  "required_keys": [
+    "record_version",
+    "content_object_id",
+    "barcode_object_id",
+    "scan_params",
+    "created_at_unix_ms",
+    "metadata"
+  ],
+  "optional_keys": [
+    "identity_link"
+  ],
+  "scan_params_keys": [
+    "window_size_bytes",
+    "step_size_bytes",
+    "m_block_size",
+    "quant_version",
+    "barcode_len",
+    "format_version",
+    "raw_data_offset",
+    "algo_version"
+  ]
+}
