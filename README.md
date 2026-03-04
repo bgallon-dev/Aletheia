@@ -10,6 +10,53 @@ Aletheia provides cryptographic and forensic verification of files through:
 2. **Forensic Identity**: Entropy-based "barcode" signatures that detect modifications and localize changes
 3. **Identity Link**: Optional Ed25519 digital signatures binding artifacts to analyst identities
 
+## How It Works
+
+### Ingest
+
+```mermaid
+flowchart LR
+    A([File on disk]) --> B[Snapshot to tmp/]
+    B --> C[SHA-256 hash]
+    C --> D[Odin entropy scanner\nsliding-window]
+    D --> E[ALBC barcode\nbinary]
+    E --> F{Already\ningested?}
+    F -- Yes --> G([Return existing artifact_id])
+    F -- No --> H[Store content object\nobjects/ CAS]
+    H --> I[Store barcode object\nobjects/ CAS]
+    I --> J[Build ArtifactRecord JSON]
+    J --> K{Sign requested?}
+    K -- Yes --> L[Ed25519 sign\nidentity_link]
+    L --> M[Write record\nrecords/]
+    K -- No --> M
+    M --> N[Insert row\nSQLite index]
+    N --> O([Return artifact_id])
+```
+
+### Verify
+
+```mermaid
+flowchart LR
+    A([artifact_id + file]) --> B[Load ArtifactRecord\nfrom records/]
+    B --> C[SHA-256 hash\nfile under test]
+    C --> D{Hash matches\ncontent_object_id?}
+    D -- No --> FAIL1([FAIL: hash mismatch])
+    D -- Yes --> E[Re-scan with\nstored params]
+    E --> F{Barcode hash\nmatches?}
+    F -- Yes --> G{Signature\npresent?}
+    F -- No --> H[Load stored barcode\nfrom objects/]
+    H --> I[Compare window-by-window\ncoarse localization]
+    I --> J{Zoom enabled?}
+    J -- Yes --> K[Zoom scan\n8x finer resolution]
+    K --> FAIL2([FAIL + byte-level\nlocalization report])
+    J -- No --> FAIL2
+    G -- No --> PASS1([PASS unsigned])
+    G -- Yes --> L[Ed25519 verify]
+    L --> M{Valid?}
+    M -- Yes --> PASS2([PASS signed])
+    M -- No --> FAIL3([FAIL: invalid signature])
+```
+
 ## Installation
 
 ```bash
@@ -315,6 +362,60 @@ aletheia cleanup --max-age 48  # Files older than 48 hours
 
 ## Architecture
 
+```mermaid
+graph TD
+    CLI["cli.py\nArgument parsing & routing"]
+
+    subgraph Core_Pipeline ["Core Pipeline"]
+        INGEST["ingest.py\nIngestPipeline"]
+        VERIFY["verify.py\nArtifactVerifier"]
+    end
+
+    subgraph Storage ["Storage Layer"]
+        REPO["repository.py\nAletheiaRepository"]
+        SQLITE[("index.sqlite3")]
+        OBJECTS[("objects/\nCAS filesystem")]
+        RECORDS[("records/\nArtifact JSON")]
+    end
+
+    subgraph Crypto ["Cryptography"]
+        IDENTITY["identity.py\nEd25519 keys & signing"]
+        KEYS[("~/.aletheia/keys/")]
+    end
+
+    subgraph Scanner ["External Scanner"]
+        ODIN["Odin binary\nentropy scanner"]
+        ALBC["ALBC barcode\nbinary format"]
+    end
+
+    DOMAIN["domain.py\nArtifactRecord · ScanParams\nIdentitySignature"]
+    ALGOS["algorithms.py\nVersion constants"]
+
+    CLI --> INGEST
+    CLI --> VERIFY
+    CLI --> REPO
+    CLI --> IDENTITY
+
+    INGEST --> ODIN
+    ODIN --> ALBC
+    INGEST --> REPO
+    INGEST --> IDENTITY
+
+    VERIFY --> ODIN
+    VERIFY --> REPO
+    VERIFY --> IDENTITY
+    VERIFY --> ALGOS
+
+    REPO --> SQLITE
+    REPO --> OBJECTS
+    REPO --> RECORDS
+
+    IDENTITY --> KEYS
+
+    DOMAIN -.->|shared types| INGEST
+    DOMAIN -.->|shared types| VERIFY
+```
+
 ### Content-Addressed Storage
 
 Files are stored by their SHA-256 hash with 2-character fanout:
@@ -355,6 +456,54 @@ JSON records link content + barcode + metadata + optional signature:
     "signed_fields": ["content_object_id", "barcode_object_id", "..."]
   }
 }
+```
+
+```mermaid
+erDiagram
+    ARTIFACT_RECORD {
+        string record_version "aletheia/ar/1"
+        string content_object_id "SHA-256 hex of file"
+        string barcode_object_id "SHA-256 hex of ALBC"
+        int created_at_unix_ms
+        object metadata
+    }
+
+    SCAN_PARAMS {
+        int window_size_bytes "default 65536"
+        int step_size_bytes "default 16384"
+        int m_block_size "default 1"
+        string quant_version
+        int barcode_len
+        int format_version "1 or 2"
+    }
+
+    IDENTITY_SIGNATURE {
+        string signature_version "aletheia/sig/ed25519/1"
+        string key_id
+        string fingerprint
+        string signed_at "ISO-8601"
+        string signature_b64 "64-byte Ed25519 sig"
+    }
+
+    CAS_OBJECT {
+        string object_id "SHA-256 hex"
+        string type "content or barcode"
+        string path "objects/XX/object_id"
+    }
+
+    SQLITE_INDEX {
+        string artifact_id
+        string content_object_id FK
+        string barcode_object_id FK
+        int created_at_unix_ms
+        string record_path
+    }
+
+    ARTIFACT_RECORD ||--|| SCAN_PARAMS : "scan_params"
+    ARTIFACT_RECORD ||--o| IDENTITY_SIGNATURE : "identity_link (optional)"
+    ARTIFACT_RECORD ||--|| CAS_OBJECT : "content_object_id refs"
+    ARTIFACT_RECORD ||--|| CAS_OBJECT : "barcode_object_id refs"
+    SQLITE_INDEX ||--|| ARTIFACT_RECORD : "indexes"
 ```
 
 ### Directory Structure
