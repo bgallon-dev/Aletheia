@@ -522,22 +522,22 @@ erDiagram
 
 ### Directory Structure
 
-```
+~~~text
 repo-root/
-├── objects/          # Content-addressed objects (2-char fanout)
-│   ├── a1/a1b2...    # Content files
-│   └── cd/cdef...    # Barcode files
-├── records/          # Artifact records (JSON)
-│   └── <artifact_id>.json
-├── tmp/              # Temporary files (auto-cleaned)
-├── config.json       # Repository configuration
-└── index.sqlite3     # SQLite index for fast queries
+|-- objects/          # Content-addressed objects (2-char fanout)
+|   |-- a1/a1b2...    # Content files
+|   \-- cd/cdef...    # Barcode files
+|-- records/          # Artifact records (JSON)
+|   \-- <artifact_id>.json
+|-- tmp/              # Temporary files (auto-cleaned)
+|-- config.json       # Repository configuration
+\-- index.sqlite3     # SQLite index for fast queries
 
 ~/.aletheia/
-└── keys/             # Signing keys (user home directory)
-    ├── analyst-alice.key   # Private key (encrypted)
-    └── analyst-alice.pub   # Public key (distributable)
-```
+\-- keys/             # Signing keys (user home directory)
+    |-- analyst-alice.key   # Private key (encrypted)
+    \-- analyst-alice.pub   # Public key (distributable)
+~~~
 
 ### Repository Config
 
