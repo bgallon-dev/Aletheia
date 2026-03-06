@@ -20,8 +20,8 @@ content-addressed, optionally signed, and stored in an append-only repository.
 | Command   | Primary input                                        |
 |-----------|------------------------------------------------------|
 | `ingest`  | One file path (regular file, any format)             |
-| `verify`  | One file path + one artifact ID                      |
-| `diff`    | Two `.albc` barcode file paths                       |
+| `verify`  | One file path + `--baseline <artifact_id>`           |
+| `diff`    | Two artifact IDs from stored repository records       |
 | `audit`   | Repository root (no file argument)                   |
 
 Directory-level batch ingest is not yet supported; call `ingest` per file.
@@ -31,7 +31,7 @@ Directory-level batch ingest is not yet supported; call `ingest` per file.
 All parameters have CLI equivalents.  Repository-level defaults live in
 `{repo}/config.json`.
 
-#### Scan parameters (ingest / verify)
+#### Scan parameters (ingest only; verify reuses stored baseline parameters)
 
 | Flag              | Default    | Description                        |
 |-------------------|------------|------------------------------------|
@@ -41,12 +41,12 @@ All parameters have CLI equivalents.  Repository-level defaults live in
 | `--threads N`     | `0` (auto) | Worker threads for scanner         |
 | `--format {1,2}`  | `1`        | ALBC binary format version         |
 
-#### Repository options (all commands)
+#### Global CLI options (all commands; must appear before subcommand)
 
 | Flag              | Default | Description                              |
 |-------------------|---------|------------------------------------------|
 | `--repo DIR`      | `.`     | Repository root directory                |
-| `--quiet`         | off     | Suppress verbose progress output         |
+| `--verbose`, `-v` | off     | Enable verbose command output            |
 | `--debug`         | off     | Print full exception tracebacks          |
 
 #### Signing & verification policy
@@ -73,9 +73,9 @@ for production.  Disabling immutability is irreversible for existing records.
 
 ### 2.3 Baseline Record (verify)
 
-`verify` takes an `artifact_id` (64-hex SHA-256 string) as the baseline.  The record
-must already exist in the repository.  Trusted public keys for signature verification
-are imported via `aletheia identity import`.
+`verify` takes a file path positional argument plus `--baseline <artifact_id>` (64-hex
+SHA-256 string). The baseline record must already exist in the repository. Trusted public
+keys for signature verification are imported via `aletheia identity import`.
 
 ---
 
@@ -130,7 +130,8 @@ version.
 ### 3.2 Binary Object (ALBC)
 
 The raw entropy barcode is stored as a content-addressed object at
-`{repo}/objects/{XX}/{sha256-hex}`.  Retrieve it via object ID (shown in `show`).
+`{repo}/objects/{XX}/{sha256-hex}`. Retrieve it via object ID (shown in `inspect`,
+with `show` as a compatibility alias).
 Format is ALBC v1 (quantized u8) or v2 (quantized u8 + raw f64); version depends on
 `--format` at ingest time.
 
@@ -151,19 +152,25 @@ Verification Report
 
 ### 3.4 JSON Report (`--json`)
 
-Available on `audit` and `diff`.  Written to stdout (redirect to capture).
+Available on `audit` and `diff`. Written to stdout (redirect to capture).
 
-Top-level keys: `report_type`, `generated_at` (ISO 8601), `repository`, `status`,
-`summary`, `findings`.
+Audit JSON keys include: `report_type`, `generated_at` (ISO 8601), `repository`,
+`status`, `summary`, `findings`.
+
+Diff JSON keys include: `artifact_id_1`, `artifact_id_2`, `identical`,
+`differing_regions`.
 
 ### 3.5 Exit Codes
 
-| Code | Meaning                                                       |
-|------|---------------------------------------------------------------|
-| `0`  | Success — ingest stored, verification passed, repo healthy    |
-| `1`  | Failure — I/O error, verification failed, corruption detected, key not found, schema invalid |
+| Code | Meaning |
+|------|---------|
+| `0`  | Success |
+| `1`  | Verification/tamper failure (integrity mismatch, invalid signature) |
+| `2`  | User error (bad args, missing file, unknown key, repo not initialized) |
+| `3`  | System error (permission denied, OS I/O errors) |
+| `4`  | Internal/unexpected error |
 
-Exit codes are **stable**.  All automated callers should check exit codes, not stdout.
+Exit codes are **stable**. All automated callers should check exit codes, not stdout.
 
 ---
 
@@ -185,7 +192,7 @@ Aletheia never modifies the **source file** passed to `ingest` or `verify`.
 ## 5. Stability Guarantees
 
 - `artifact_id` derivation formula is frozen: `SHA-256("ALETHEIA_AR_V1" ‖ content_bytes ‖ barcode_bytes)`.
-- Exit codes `0` / `1` are stable.
+- Exit codes `0` / `1` / `2` / `3` / `4` are stable.
 - JSON field names in `record_version: aletheia/ar/1` records are stable.
 - The ALBC binary magic bytes (`ALBC0001`, `ALBC0002`) identify format versions permanently.
 - Scan parameters stored in a record are always used verbatim during re-verification.
@@ -209,7 +216,7 @@ Aletheia never modifies the **source file** passed to `ingest` or `verify`.
 | This contract           | v0.1                     | —                               |
 
 Breaking changes in any versioned schema will increment the version string.
-Old records remain readable; the CLI will report the schema version on `show`.
+Old records remain readable; the CLI will report the schema version on `inspect` (`show` alias).
 
 ---
 

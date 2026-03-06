@@ -76,22 +76,41 @@ aletheia ingest <any-file>
 ## Quick Start
 
 ```bash
+# Initialize repository once
+aletheia --repo . init
+
 # Ingest a file
-aletheia ingest document.pdf
+aletheia --repo . ingest document.pdf
 
 # Verify the file later
-aletheia verify <artifact_id> --file document.pdf
+aletheia --repo . verify document.pdf --baseline <artifact_id>
 
 # List all artifacts
-aletheia list
+aletheia --repo . list
 
 # Run integrity audit
-aletheia audit
+aletheia --repo . audit
 ```
 
 For an interview-friendly end-to-end walkthrough, see [`PORTFOLIO_DEMO.md`](PORTFOLIO_DEMO.md).
 
 ## Commands
+
+**Global options (must appear before the subcommand):**
+
+| Option            | Description                              |
+| ----------------- | ---------------------------------------- |
+| `--repo <path>`   | Repository root directory (default: `.`) |
+| `--verbose`, `-v` | Enable verbose output                    |
+| `--debug`         | Show full tracebacks on error            |
+
+### `aletheia init`
+
+Initialize a repository at `--repo` (idempotent).
+
+```bash
+aletheia --repo forensic-repo init
+```
 
 ### `aletheia ingest <file>`
 
@@ -99,6 +118,7 @@ Ingest a file into the repository with entropy barcode generation.
 
 ```bash
 aletheia ingest example.pdf
+aletheia --repo forensic-repo ingest example.pdf
 aletheia ingest example.pdf --window 65536 --step 16384 --m 1
 aletheia ingest large_video.mp4 --threads 8
 
@@ -111,34 +131,32 @@ aletheia ingest evidence.pdf --format 2
 
 **Options:**
 
-| Option             | Description                                            |
-| ------------------ | ------------------------------------------------------ |
+| Option             | Description                                             |
+| ------------------ | ------------------------------------------------------- |
 | `--window <bytes>` | Entropy window size (default: 65536 / 64KB)            |
 | `--step <bytes>`   | Step size between windows (default: 16384 / 16KB)      |
 | `--m <1\|2>`       | Block size for entropy calculation (default: 1)        |
 | `--threads <N>`    | Thread count for parallel scanning (default: auto)     |
 | `--format <1\|2>`  | ALBC format version (1=quantized, 2=quantized+raw f64) |
-| `--repo <path>`    | Repository root directory (default: .)                 |
-| `--no-auto-init`   | Don't auto-initialize repository                       |
-| `--quiet`          | Suppress verbose output                                |
-| `--keep-temp`      | Keep temporary .albc barcode file                      |
-| `--sign <key_id>`  | Sign artifact with specified key                       |
-| `--passphrase`     | Prompt for key passphrase                              |
+| `--no-auto-init`   | Don't auto-initialize repository                        |
+| `--keep-temp`      | Keep temporary .albc barcode file                       |
+| `--sign <key_id>`  | Sign artifact with specified key                        |
+| `--passphrase`     | Prompt for key passphrase                               |
 
 **Format Versions:**
 
 - **Format 1 (default)**: Stores quantized u8 entropy values (1 byte per window). Suitable for most use cases.
-- **Format 2**: Stores both quantized u8 AND raw f64 entropy values. Required for sub-quantization precision during forensic zoom scans. Larger file size but detects changes below the u8 quantization threshold (Δ < 0.001 entropy).
+- **Format 2**: Stores both quantized u8 AND raw f64 entropy values. Required for sub-quantization precision during forensic zoom scans. Larger file size but detects changes below the u8 quantization threshold (delta < 0.001 entropy).
 
 **Idempotent**: Re-ingesting the same file with identical parameters produces the same artifact ID.
 
-### `aletheia verify <artifact_id> --file <path>`
+### `aletheia verify <path> --baseline <artifact_id>`
 
 Verify a file against a stored artifact with three independent checks:
 
 ```bash
-aletheia verify abc123... --file document.pdf
-aletheia verify abc123... --file document.pdf --no-zoom
+aletheia verify document.pdf --baseline abc123...
+aletheia --repo forensic-repo verify document.pdf --baseline abc123... --no-zoom
 ```
 
 **Verification Checks:**
@@ -149,22 +167,40 @@ aletheia verify abc123... --file document.pdf --no-zoom
 
 **Options:**
 
-| Option          | Description                                  |
-| --------------- | -------------------------------------------- |
-| `--file <path>` | File to verify (required)                    |
-| `--repo <path>` | Repository root (default: .)                 |
-| `--quiet`       | Suppress verbose output                      |
-| `--no-zoom`     | Disable zoom scan (coarse localization only) |
-| `--require-signature` | Require valid identity signature (fails if missing/invalid) |
+| Option                     | Description                                                 |
+| -------------------------- | ----------------------------------------------------------- |
+| `<path>`                   | File to verify (required positional argument)               |
+| `--baseline <artifact_id>` | Artifact ID to verify against (required)                    |
+| `--no-zoom`                | Disable zoom scan (coarse localization only)                |
+| `--require-signature`      | Require valid identity signature (fails if missing/invalid) |
 
-**Zoom Scan**: When forensic check fails, automatically performs high-resolution analysis on modified regions (8× finer than baseline) to precisely localize changes. If the baseline was ingested with `--format 2`, zoom scan uses raw f64 comparison for sub-quantization precision.
+**Zoom Scan**: When forensic check fails, automatically performs high-resolution analysis on modified regions (8x finer than baseline) to precisely localize changes. If the baseline was ingested with `--format 2`, zoom scan uses raw f64 comparison for sub-quantization precision.
 
-### `aletheia show <artifact_id>`
+### `aletheia inspect <artifact_id>` (alias: `show`)
 
 Display detailed artifact information.
 
 ```bash
+aletheia inspect abc123def456...
 aletheia show abc123def456...
+```
+
+### `aletheia export <artifact_id>`
+
+Export a full artifact record as JSON.
+
+```bash
+aletheia export abc123def456...
+aletheia export abc123def456... --output artifact.json
+```
+
+### `aletheia sign <artifact_id> --key <key_id>`
+
+Sign an existing artifact record.
+
+```bash
+aletheia sign abc123def456... --key analyst-alice --passphrase
+aletheia sign abc123def456... --key analyst-alice --force
 ```
 
 ### `aletheia list`
@@ -208,30 +244,28 @@ aletheia identity import colleague-public.json
 
 **Key Generation Options:**
 
-| Option            | Description                      |
-| ----------------- | -------------------------------- |
-| `--name <name>`   | Key owner name                   |
-| `--email <email>` | Key owner email                  |
-| `--org <org>`     | Organization                     |
-| `--passphrase`    | Prompt for encryption passphrase (default) |
+| Option            | Description                                   |
+| ----------------- | --------------------------------------------- |
+| `--name <name>`   | Key owner name                                |
+| `--email <email>` | Key owner email                               |
+| `--org <org>`     | Organization                                  |
+| `--passphrase`    | Prompt for encryption passphrase (default)    |
 | `--no-passphrase` | Store private key unencrypted (not recommended) |
 
-### `aletheia diff <file1.albc> <file2.albc>`
+### `aletheia diff <artifact_id_1> <artifact_id_2>`
 
-Compare two ALBC barcode files.
+Compare the stored barcodes referenced by two artifact records.
 
 ```bash
-aletheia diff baseline.albc suspect.albc
-aletheia diff baseline.albc suspect.albc --threshold 2.5
-aletheia diff baseline.albc suspect.albc --json
+aletheia diff abc123... def456...
+aletheia diff abc123... def456... --json
 ```
 
 **Options:**
 
-| Option              | Description                          |
-| ------------------- | ------------------------------------ |
-| `--threshold <num>` | Count windows with delta > threshold |
-| `--json`            | Output machine-readable JSON         |
+| Option   | Description                  |
+| -------- | ---------------------------- |
+| `--json` | Output machine-readable JSON |
 
 ### `aletheia audit`
 
@@ -251,13 +285,11 @@ aletheia audit --output report.txt
 | `--no-orphans`    | Skip orphaned file detection |
 | `--json`          | Output report as JSON        |
 | `--output <file>` | Write report to file         |
-| `--repo <path>`   | Repository root (default: .) |
-| `--quiet`         | Suppress progress output     |
 
 **Audit Checks:**
 
 - **Missing Objects**: Database entries with no file on disk (DATA LOSS)
-- **Corrupted Objects**: Files where hash ≠ object_id (BIT ROT / TAMPERING)
+- **Corrupted Objects**: Files where hash != object_id (BIT ROT / TAMPERING)
 - **Orphaned Objects**: Files on disk not in database (JUNK DATA)
 
 ### `aletheia rebuild`
@@ -277,6 +309,14 @@ Clean up abandoned temporary files.
 ```bash
 aletheia cleanup
 aletheia cleanup --max-age 48  # Files older than 48 hours
+```
+
+### `aletheia doctor`
+
+Run system health checks (scanner binary, repository, database, write permission, disk space, keys).
+
+```bash
+aletheia --repo forensic-repo doctor
 ```
 
 ## Verification Output
@@ -554,7 +594,7 @@ aletheia identity export analyst-alice > alice-public.json
 aletheia identity import alice-public.json
 
 # Verifier can now verify signed artifacts
-aletheia verify <artifact_id> --file evidence.pdf
+aletheia verify evidence.pdf --baseline <artifact_id>
 ```
 
 ## Performance Notes
@@ -710,7 +750,7 @@ stats = repo.audit_objects(verbose=True, check_orphans=True)
 
 ## Requirements
 
-- Python 3.8+
+- Python 3.9+
 - Odin entropy scanner (compiled binary, Windows-first build)
 - Optional: `cryptography` package for digital signatures
 
