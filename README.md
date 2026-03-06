@@ -362,59 +362,33 @@ aletheia cleanup --max-age 48  # Files older than 48 hours
 
 ## Architecture
 
-```mermaid
-graph TD
-    CLI["cli.py\nArgument parsing & routing"]
+The project now follows a primitive-first split:
 
-    subgraph Core_Pipeline ["Core Pipeline"]
-        INGEST["ingest.py\nIngestPipeline"]
-        VERIFY["verify.py\nArtifactVerifier"]
-    end
-
-    subgraph Storage ["Storage Layer"]
-        REPO["repository.py\nAletheiaRepository"]
-        SQLITE[("index.sqlite3")]
-        OBJECTS[("objects/\nCAS filesystem")]
-        RECORDS[("records/\nArtifact JSON")]
-    end
-
-    subgraph Crypto ["Cryptography"]
-        IDENTITY["identity.py\nEd25519 keys & signing"]
-        KEYS[("~/.aletheia/keys/")]
-    end
-
-    subgraph Scanner ["External Scanner"]
-        ODIN["Odin binary\nentropy scanner"]
-        ALBC["ALBC barcode\nbinary format"]
-    end
-
-    DOMAIN["domain.py\nArtifactRecord Â· ScanParams\nIdentitySignature"]
-    ALGOS["algorithms.py\nVersion constants"]
-
-    CLI --> INGEST
-    CLI --> VERIFY
-    CLI --> REPO
-    CLI --> IDENTITY
-
-    INGEST --> ODIN
-    ODIN --> ALBC
-    INGEST --> REPO
-    INGEST --> IDENTITY
-
-    VERIFY --> ODIN
-    VERIFY --> REPO
-    VERIFY --> IDENTITY
-    VERIFY --> ALGOS
-
-    REPO --> SQLITE
-    REPO --> OBJECTS
-    REPO --> RECORDS
-
-    IDENTITY --> KEYS
-
-    DOMAIN -.->|shared types| INGEST
-    DOMAIN -.->|shared types| VERIFY
+```text
+aletheia/
++-- core/          # storage-independent primitive API
+¦   +-- barcode.py
+¦   +-- scanner.py
+¦   +-- albc.py
+¦   +-- entropy.py
+¦   +-- types.py
++-- store/         # repository-backed application layer
+¦   +-- artifacts.py
+¦   +-- repository.py
+¦   +-- verify.py
+¦   +-- identity.py
++-- cli/           # command-line interface
+¦   +-- main.py
+¦   +-- formatters.py
++-- domain.py
++-- algorithms.py
++-- utils.py
 ```
+
+Dependency rule:
+- `core` imports nothing from `store` or `cli`.
+- `store` can import `core`, but never `cli`.
+- `cli` can import both `core` and `store`.
 
 ### Content-Addressed Storage
 
@@ -640,6 +614,23 @@ Offset  Size  Field
 
 ## Direct Module Usage
 
+### Primitive API (No Repository)
+
+```python
+from aletheia.core import scan_file, compare_barcodes, load_albc, save_albc
+
+baseline = scan_file("firmware.bin", window_size=65536, step_size=16384)
+save_albc("firmware.albc", baseline)
+
+current = scan_file("firmware_suspect.bin", window_size=65536, step_size=16384)
+reference = load_albc("firmware.albc")
+diff = compare_barcodes(reference, current)
+
+if diff.regions:
+    for region in diff.regions:
+        print(region.start_byte, region.end_byte, region.magnitude)
+```
+
 ### Ingest Pipeline
 
 ```python
@@ -659,7 +650,7 @@ artifact_id = pipeline.ingest(
 ### Verification
 
 ```python
-from aletheia.verify import ArtifactVerifier
+from aletheia.store.verify import ArtifactVerifier
 
 verifier = ArtifactVerifier(repo_root=".")
 result = verifier.verify(artifact_id, "document.pdf", enable_zoom=True)
@@ -675,7 +666,7 @@ else:
 ### Identity Operations
 
 ```python
-from aletheia.identity import IdentityLink
+from aletheia.store.identity import IdentityLink
 
 identity = IdentityLink()
 
@@ -697,7 +688,7 @@ print(f"Valid: {result['valid']}")
 ### Repository Operations
 
 ```python
-from aletheia.repository import AletheiaRepository
+from aletheia.store.repository import AletheiaRepository
 
 repo = AletheiaRepository(".", auto_init=True)
 

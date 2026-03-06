@@ -136,7 +136,7 @@ def test_hash_and_copy_destination_byte_identical_to_source(tmp_path):
 @pytest.mark.slow
 def test_store_object_from_file_5mb_bounded_memory(tmp_path):
     """Streaming ingest of a 5 MB file must not allocate more than MEMORY_THRESHOLD_BYTES."""
-    from aletheia.repository import AletheiaRepository
+    from aletheia.store.repository import AletheiaRepository
     from aletheia.utils import compute_file_hash
 
     repo = AletheiaRepository(str(tmp_path), auto_init=True)

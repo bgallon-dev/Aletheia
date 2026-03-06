@@ -1,4 +1,4 @@
-from aletheia.verify import VerificationResult
+from aletheia.store.verify import VerificationResult
 
 
 def _passing_result() -> VerificationResult:

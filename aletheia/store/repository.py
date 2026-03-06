@@ -10,8 +10,8 @@ import uuid
 import time
 import re
 
-from .domain import ArtifactRecord, RepoConfig, SchemaValidationError
-from .utils import compute_file_hash, hash_and_copy_file, hash_bytes
+from ..domain import ArtifactRecord, RepoConfig, SchemaValidationError
+from ..utils import compute_file_hash, hash_and_copy_file, hash_bytes
 
 OBJECT_ID_RE = re.compile(r"^[0-9a-f]{64}$")
 
@@ -942,7 +942,7 @@ class AletheiaRepository:
             ImmutabilityError: Already signed and allow_overwrite=False.
             SchemaValidationError: sig_block_dict is malformed.
         """
-        from .domain import IdentitySignature
+        from ..domain import IdentitySignature
         import dataclasses
 
         record_path = self.records_dir / f"{artifact_id}.json"

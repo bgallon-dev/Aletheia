@@ -14,7 +14,7 @@ from pathlib import Path
 
 import pytest
 
-from aletheia.repository import AletheiaRepository, ObjectNotFoundError, RepositoryError
+from aletheia.store.repository import AletheiaRepository, ObjectNotFoundError, RepositoryError
 
 from conftest import minimal_record
 

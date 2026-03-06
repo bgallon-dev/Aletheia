@@ -126,7 +126,7 @@ def test_nonexistent_file_error_in_stderr(tmp_path):
 
 def test_list_on_empty_repo_exits_zero(tmp_path):
     """'list' on a freshly initialized (but empty) repo must exit 0."""
-    from aletheia.repository import AletheiaRepository
+    from aletheia.store.repository import AletheiaRepository
 
     AletheiaRepository(str(tmp_path), auto_init=True)
     result = _run("--repo", str(tmp_path), "list")

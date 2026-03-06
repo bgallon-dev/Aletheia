@@ -17,7 +17,7 @@ import base64
 
 import pytest
 
-from aletheia.identity import CRYPTO_AVAILABLE, IdentityError, IdentityLink, validate_key_id
+from aletheia.store.identity import CRYPTO_AVAILABLE, IdentityError, IdentityLink, validate_key_id
 
 from conftest import minimal_record
 

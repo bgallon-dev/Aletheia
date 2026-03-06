@@ -6,7 +6,7 @@ from pathlib import Path
 import pytest
 
 from aletheia import ingest as ingest_module
-from aletheia.repository import AletheiaRepository, RepositoryError
+from aletheia.store.repository import AletheiaRepository, RepositoryError
 from aletheia.utils import compute_file_hash
 
 

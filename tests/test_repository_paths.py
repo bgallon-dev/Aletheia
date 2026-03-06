@@ -2,7 +2,7 @@ from pathlib import Path
 
 import pytest
 
-from aletheia.repository import AletheiaRepository, RepositoryError
+from aletheia.store.repository import AletheiaRepository, RepositoryError
 
 
 def test_object_path_uses_two_char_fanout(tmp_path):

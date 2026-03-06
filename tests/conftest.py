@@ -91,7 +91,7 @@ def small_file(tmp_path: Path) -> Path:
 @pytest.fixture
 def initialized_repo(tmp_path: Path):
     """AletheiaRepository fully initialized in a temp directory."""
-    from aletheia.repository import AletheiaRepository
+    from aletheia.store.repository import AletheiaRepository
 
     return AletheiaRepository(str(tmp_path), auto_init=True)
 

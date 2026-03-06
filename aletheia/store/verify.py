@@ -14,19 +14,20 @@ import hashlib
 import json
 import logging
 from pathlib import Path
-from typing import Dict, Any, Tuple, List, Optional
+from typing import Dict, List, Optional, Tuple
 
-from .domain import ArtifactRecord, SchemaValidationError
+from ..algorithms import ZOOM_V1
+from ..core.albc import ALBCParser
+from ..core.scanner import OdinScanner
+from ..domain import ArtifactRecord, SchemaValidationError
+from ..utils import compute_file_hash
 from .repository import AletheiaRepository, RepositoryNotInitializedError
-from .ingest import OdinScanner, ALBCParser
-from .utils import compute_file_hash
-from .algorithms import ZOOM_V1
 
 # Zoom scan parameters are defined in algorithms.ZOOM_V1
 logger = logging.getLogger(__name__)
 
 try:
-    from .identity import IdentityLink, SignatureInvalidError
+    from .identity import IdentityLink
 
     IDENTITY_AVAILABLE = True
 except ImportError:
@@ -225,7 +226,7 @@ class VerificationResult:
                         )
                 else:
                     lines.append(
-                        f"    No fine-grained differences (coarse mismatch may be quantization artifact)"
+                        "    No fine-grained differences (coarse mismatch may be quantization artifact)"
                     )
 
         # NEW: Signature verification section

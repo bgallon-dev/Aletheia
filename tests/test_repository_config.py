@@ -2,7 +2,7 @@ import json
 
 import pytest
 
-from aletheia.repository import AletheiaRepository, ImmutabilityError
+from aletheia.store.repository import AletheiaRepository, ImmutabilityError
 
 
 def _record_payload(content_object_id: str, barcode_object_id: str, filename: str) -> dict:

@@ -23,7 +23,7 @@ from datetime import datetime
 from pathlib import Path
 from typing import Dict, Any, Optional, Tuple, List
 
-from .domain import ArtifactRecord, IdentitySignature, ScanParams
+from ..domain import ArtifactRecord, IdentitySignature, ScanParams
 
 # Use cryptography library (widely available, audited)
 try:

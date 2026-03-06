@@ -1,6 +1,6 @@
 import pytest
 
-from aletheia.identity import (
+from aletheia.store.identity import (
     CRYPTO_AVAILABLE,
     IdentityError,
     IdentityLink,
