@@ -70,7 +70,7 @@ class IngestPipeline:
 
     def __init__(
         self,
-        repo_root: str = ".",
+        repo_root: str = "aletheia_repo",
         odin_binary: Optional[str] = None,
         auto_init: bool = True,
         repository_cls: Type[AletheiaRepository] = AletheiaRepository,

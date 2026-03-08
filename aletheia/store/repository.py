@@ -55,12 +55,12 @@ class ImmutabilityError(RepositoryError):
 class AletheiaRepository:
     """Content-addressed storage repository with SQLite indexing."""
 
-    def __init__(self, repo_root: str = ".", auto_init: bool = True):
+    def __init__(self, repo_root: str = "aletheia_repo", auto_init: bool = True):
         """
         Initialize repository.
 
         Args:
-            repo_root: Root directory for the repository
+            repo_root: Root directory for the repository (default: aletheia_repo)
             auto_init: If True, automatically create directory structure and database.
                       If False, fail fast if structure doesn't exist.
         """
@@ -1181,3 +1181,72 @@ class AletheiaRepository:
                     pass
 
         return deleted
+
+
+# ---------------------------------------------------------------------------
+# Legacy root-data migration (called on implicit default-path startup)
+# ---------------------------------------------------------------------------
+
+_MIGRATE_DIRS = ["objects", "records", "tmp"]
+_MIGRATE_FILES = [
+    "config.json",
+    "index.sqlite3",
+    "index.sqlite3-wal",
+    "index.sqlite3-shm",
+]
+
+
+def migrate_legacy_root_data(root: Path, dest: Path) -> bool:
+    """Migrate legacy runtime data from the project root into *dest*.
+
+    This is triggered once when ``--repo`` was not explicitly provided and the
+    default ``aletheia_repo`` directory is used.  It is safe to call repeatedly
+    (idempotent): if no legacy marker (``config.json``) exists in *root* the
+    function returns ``False`` without touching anything.
+
+    Conflict policy: source (root) wins — destination files are overwritten.
+    Copy-then-delete semantics: a source item is never deleted until its copy
+    has completed successfully, so partial failures leave source data intact.
+
+    Args:
+        root: Project root directory to migrate *from* (typically ``Path(".")``)
+        dest: Destination repository directory (typically ``Path("aletheia_repo")``)
+
+    Returns:
+        ``True`` if at least one item was migrated, ``False`` if nothing to do.
+    """
+    # Only migrate if a legacy repository marker exists in root.
+    if not (root / "config.json").exists():
+        return False
+
+    # Guard against migrating into the same directory.
+    try:
+        if root.resolve() == dest.resolve():
+            return False
+    except OSError:
+        return False
+
+    dest.mkdir(parents=True, exist_ok=True)
+
+    migrated = False
+
+    for dir_name in _MIGRATE_DIRS:
+        src_dir = root / dir_name
+        if not src_dir.exists():
+            continue
+        dst_dir = dest / dir_name
+        # Copy first (source wins), then delete source.
+        shutil.copytree(str(src_dir), str(dst_dir), dirs_exist_ok=True)
+        shutil.rmtree(src_dir)
+        migrated = True
+
+    for file_name in _MIGRATE_FILES:
+        src_file = root / file_name
+        if not src_file.exists():
+            continue
+        dst_file = dest / file_name
+        shutil.copy2(str(src_file), str(dst_file))
+        src_file.unlink()
+        migrated = True
+
+    return migrated

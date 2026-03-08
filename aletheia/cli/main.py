@@ -25,7 +25,11 @@ from ..store.repository import (
     RepositoryNotInitializedError,
 )
 from ..store.verify import ArtifactVerifier
-from .formatters import format_forensic_report, format_timestamp, generate_forensic_report
+from .formatters import (
+    format_forensic_report,
+    format_timestamp,
+    generate_forensic_report,
+)
 
 
 EXIT_OK = 0  # success
@@ -167,7 +171,9 @@ def cmd_verify(args: argparse.Namespace) -> int:
         print(report)
     except UnicodeEncodeError:
         encoding = sys.stdout.encoding or "utf-8"
-        print(report.encode(encoding, errors="replace").decode(encoding, errors="replace"))
+        print(
+            report.encode(encoding, errors="replace").decode(encoding, errors="replace")
+        )
 
     if result.error:
         lowered = result.error.lower()
@@ -208,7 +214,9 @@ def cmd_list(args: argparse.Namespace) -> int:
         else:
             scan_params = "N/A"
 
-        record_path = Path(artifact["record_path"]).name if artifact["record_path"] else "N/A"
+        record_path = (
+            Path(artifact["record_path"]).name if artifact["record_path"] else "N/A"
+        )
         print(f"{artifact_id_short}..  {created}  {scan_params:<20}  {record_path}")
 
     print()
@@ -289,7 +297,9 @@ def cmd_sign(args: argparse.Namespace) -> int:
     from ..store.identity import CRYPTO_AVAILABLE, IdentityLink
 
     if not CRYPTO_AVAILABLE:
-        logger.error("cryptography package required. Install with: pip install cryptography")
+        logger.error(
+            "cryptography package required. Install with: pip install cryptography"
+        )
         return EXIT_USER_ERROR
 
     passphrase = None
@@ -316,8 +326,11 @@ def cmd_sign(args: argparse.Namespace) -> int:
         )
         return EXIT_USER_ERROR
 
-    sig_block = identity.sign_artifact_record(raw, key_id=args.key_id, passphrase=passphrase)
-    sig_dict = sig_block.to_dict() if hasattr(sig_block, "to_dict") else sig_block
+    sig_block = identity.sign_artifact_record(
+        raw, key_id=args.key_id, passphrase=passphrase
+    )
+    _to_dict = getattr(sig_block, "to_dict", None)
+    sig_dict = _to_dict() if _to_dict is not None else sig_block
     repo.update_artifact_identity_link(
         args.artifact_id,
         sig_dict,
@@ -400,7 +413,9 @@ def cmd_audit(args: argparse.Namespace) -> int:
     else:
         print(report_text)
 
-    has_issues = len(stats.get("corrupted", [])) > 0 or len(stats.get("missing_files", [])) > 0
+    has_issues = (
+        len(stats.get("corrupted", [])) > 0 or len(stats.get("missing_files", [])) > 0
+    )
     return EXIT_VERIFICATION_FAILED if has_issues else EXIT_OK
 
 
@@ -432,19 +447,20 @@ def cmd_doctor(args: argparse.Namespace) -> int:
     check("Repository", _repo)
 
     if repo is not None:
+        _checked_repo: AletheiaRepository = repo
 
         def _db():
-            conn = repo._connect()
+            conn = _checked_repo._connect()
             conn.execute("SELECT COUNT(*) FROM artifacts").fetchone()
             conn.close()
-            return f"SQLite OK ({repo.db_path.name})"
+            return f"SQLite OK ({_checked_repo.db_path.name})"
 
         check("Database", _db)
 
         def _write():
             import uuid as _uuid
 
-            p = repo.tmp_dir / f".probe_{_uuid.uuid4().hex}"
+            p = _checked_repo.tmp_dir / f".probe_{_uuid.uuid4().hex}"
             p.write_bytes(b"")
             p.unlink(missing_ok=True)
             return "tmp/ writable"
@@ -454,7 +470,7 @@ def cmd_doctor(args: argparse.Namespace) -> int:
         def _disk():
             import shutil
 
-            free = shutil.disk_usage(str(repo.root)).free / (1024**3)
+            free = shutil.disk_usage(str(_checked_repo.root)).free / (1024**3)
             label = "OK" if free >= 1.0 else "LOW"
             return f"{free:.1f} GB free ({label})"
 
@@ -588,7 +604,9 @@ def cmd_identity_generate(args: argparse.Namespace) -> int:
             logger.error("Passphrases do not match")
             return EXIT_USER_ERROR
 
-    result = identity.generate_key(args.key_id, passphrase=passphrase, metadata=metadata)
+    result = identity.generate_key(
+        args.key_id, passphrase=passphrase, metadata=metadata
+    )
 
     print(f"\nGenerated new signing key: {args.key_id}")
     print(f"  Fingerprint:   {result['fingerprint']}")
@@ -620,7 +638,9 @@ def cmd_identity_list(args: argparse.Namespace) -> int:
     for key in keys:
         encrypted = "Yes" if key.get("encrypted") else "No"
         created = key.get("created_at", "N/A")[:10]
-        print(f"{key['key_id']:<30}  {key['fingerprint']:<18}  {encrypted:<10}  {created}")
+        print(
+            f"{key['key_id']:<30}  {key['fingerprint']:<18}  {encrypted:<10}  {created}"
+        )
 
     print(f"\nKey directory: {identity.key_dir}")
     return EXIT_OK
@@ -645,6 +665,23 @@ def cmd_identity_import(args: argparse.Namespace) -> int:
     return EXIT_OK
 
 
+def _auto_migrate_legacy(root: "Path", dest: "Path") -> None:
+    """Run auto-migration of legacy root data; log if anything was moved."""
+    from ..store.repository import migrate_legacy_root_data
+
+    try:
+        migrated = migrate_legacy_root_data(root, dest)
+        if migrated:
+            logger.info(
+                "Auto-migrated legacy repository data from '%s' into '%s'. "
+                "Use --repo . to keep using the project root directly.",
+                root,
+                dest,
+            )
+    except Exception as exc:
+        logger.warning("Auto-migration failed (non-fatal): %s", exc)
+
+
 def main() -> int:
     """Main CLI entry point using argparse subparsers."""
     parser = argparse.ArgumentParser(
@@ -653,22 +690,43 @@ def main() -> int:
             "Aletheia Repository CLI - Content-addressed storage with forensic verification"
         ),
     )
-    parser.add_argument("--repo", default=".", help="Repository root directory")
-    parser.add_argument("--verbose", "-v", action="store_true", help="Enable verbose output")
+    parser.add_argument(
+        "--repo",
+        default=None,
+        help=(
+            "Repository root directory (default: aletheia_repo). "
+            "On first run without --repo, any existing runtime data found at the "
+            "project root is automatically migrated into aletheia_repo. "
+            "Pass --repo . to use the project root directly (legacy behavior)."
+        ),
+    )
+    parser.add_argument(
+        "--verbose", "-v", action="store_true", help="Enable verbose output"
+    )
     parser.add_argument("--quiet", action="store_true", help=argparse.SUPPRESS)
-    parser.add_argument("--debug", action="store_true", help="Show full tracebacks on error")
+    parser.add_argument(
+        "--debug", action="store_true", help="Show full tracebacks on error"
+    )
 
-    subparsers = parser.add_subparsers(dest="command", required=True, help="Available commands")
+    subparsers = parser.add_subparsers(
+        dest="command", required=True, help="Available commands"
+    )
 
     p_init = subparsers.add_parser("init", help="Initialize a new repository")
     p_init.set_defaults(func=cmd_init)
 
     p_ingest = subparsers.add_parser("ingest", help="Ingest a file into the repository")
     p_ingest.add_argument("file", help="File to ingest")
-    p_ingest.add_argument("--window", type=int, default=65536, help="Window size in bytes")
+    p_ingest.add_argument(
+        "--window", type=int, default=65536, help="Window size in bytes"
+    )
     p_ingest.add_argument("--step", type=int, default=16384, help="Step size in bytes")
-    p_ingest.add_argument("--m", type=int, default=1, help="Block size for entropy calculation")
-    p_ingest.add_argument("--threads", type=int, default=0, help="Thread count (0=auto)")
+    p_ingest.add_argument(
+        "--m", type=int, default=1, help="Block size for entropy calculation"
+    )
+    p_ingest.add_argument(
+        "--threads", type=int, default=0, help="Thread count (0=auto)"
+    )
     p_ingest.add_argument(
         "--format",
         type=int,
@@ -676,14 +734,18 @@ def main() -> int:
         default=1,
         help="ALBC format version",
     )
-    p_ingest.add_argument("--keep-temp", action="store_true", help="Keep temporary .albc file")
+    p_ingest.add_argument(
+        "--keep-temp", action="store_true", help="Keep temporary .albc file"
+    )
     p_ingest.add_argument(
         "--no-auto-init",
         action="store_true",
         help="Fail if repository is not initialized",
     )
     p_ingest.add_argument("--sign", metavar="KEY_ID", help="Sign with this key ID")
-    p_ingest.add_argument("--passphrase", action="store_true", help="Prompt for signing passphrase")
+    p_ingest.add_argument(
+        "--passphrase", action="store_true", help="Prompt for signing passphrase"
+    )
     p_ingest.set_defaults(func=cmd_ingest)
 
     p_verify = subparsers.add_parser(
@@ -704,7 +766,9 @@ def main() -> int:
     p_list.add_argument("--limit", type=int, default=20, help="Max artifacts to show")
     p_list.set_defaults(func=cmd_list)
 
-    p_inspect = subparsers.add_parser("inspect", help="Show human-readable artifact summary")
+    p_inspect = subparsers.add_parser(
+        "inspect", help="Show human-readable artifact summary"
+    )
     p_inspect.add_argument("artifact_id")
     p_inspect.set_defaults(func=cmd_inspect)
 
@@ -722,7 +786,9 @@ def main() -> int:
     p_sign.add_argument("artifact_id")
     p_sign.add_argument("--key", required=True, dest="key_id", metavar="KEY_ID")
     p_sign.add_argument("--passphrase", action="store_true")
-    p_sign.add_argument("--force", action="store_true", help="Overwrite existing signature")
+    p_sign.add_argument(
+        "--force", action="store_true", help="Overwrite existing signature"
+    )
     p_sign.set_defaults(func=cmd_sign)
 
     p_doctor = subparsers.add_parser("doctor", help="Run system health checks")
@@ -735,7 +801,9 @@ def main() -> int:
     p_audit.set_defaults(func=cmd_audit)
 
     p_cleanup = subparsers.add_parser("cleanup", help="Clean up abandoned temp files")
-    p_cleanup.add_argument("--max-age", type=int, default=24, help="Max age in hours (default: 24)")
+    p_cleanup.add_argument(
+        "--max-age", type=int, default=24, help="Max age in hours (default: 24)"
+    )
     p_cleanup.set_defaults(func=cmd_cleanup)
 
     p_rebuild = subparsers.add_parser(
@@ -789,6 +857,13 @@ def main() -> int:
 
     args = parser.parse_args()
     setup_logging(verbose=args.verbose, debug=args.debug)
+
+    # Resolve implicit default repo path and trigger one-time auto-migration.
+    _implicit_repo = args.repo is None
+    if _implicit_repo:
+        args.repo = "aletheia_repo"
+        _auto_migrate_legacy(Path("."), Path(args.repo))
+
     return args.func(args)
 
 

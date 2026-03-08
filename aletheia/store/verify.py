@@ -17,8 +17,8 @@ from pathlib import Path
 from typing import Dict, List, Optional, Tuple
 
 from ..algorithms import ZOOM_V1
-from ..core.albc import ALBCParser
-from ..core.scanner import OdinScanner
+from ..core.albc import ALBCParser, build_albc_bytes
+from ..core.scanner import OdinScanner, scan_file
 from ..domain import ArtifactRecord, SchemaValidationError
 from ..utils import compute_file_hash
 from .repository import AletheiaRepository, RepositoryNotInitializedError
@@ -253,7 +253,7 @@ class VerificationResult:
 class ArtifactVerifier:
     """Verify artifacts against repository records."""
 
-    def __init__(self, repo_root: str = "."):
+    def __init__(self, repo_root: str = "aletheia_repo"):
         """Initialize verifier."""
         try:
             self.repo = AletheiaRepository(repo_root, auto_init=False)
@@ -479,6 +479,59 @@ class ArtifactVerifier:
 
         return result
 
+    def _scan_zoom_slice(
+        self,
+        file_path: str,
+        window_size: int,
+        step_size: int,
+        m: int,
+        start_byte: int,
+        end_byte: int,
+        output_format: int,
+        verbose: bool,
+    ) -> bytes:
+        """Scan a byte range for zoom analysis with Python fallback."""
+        temp_path: Optional[str] = None
+        try:
+            albc_bytes, temp_path = self.scanner.scan(
+                file_path=file_path,
+                window_size=window_size,
+                step_size=step_size,
+                m=m,
+                threads=0,
+                verbose=False,
+                start_byte=start_byte,
+                end_byte=end_byte,
+                output_format=output_format,
+            )
+            return albc_bytes
+        except Exception as exc:
+            if verbose:
+                logger.warning(
+                    "    Range scan unavailable for '%s'; using Python scanner fallback: %s",
+                    file_path,
+                    exc,
+                )
+
+            fallback_result = scan_file(
+                file_path=file_path,
+                window_size=window_size,
+                step_size=step_size,
+                m=m,
+                threads=0,
+                output_format=output_format,
+                start_byte=start_byte,
+                end_byte=end_byte,
+                prefer_python=True,
+            )
+            return build_albc_bytes(fallback_result)
+        finally:
+            if temp_path:
+                try:
+                    Path(temp_path).unlink()
+                except OSError:
+                    pass
+
     def _perform_zoom_scan(
         self,
         result: VerificationResult,
@@ -516,6 +569,7 @@ class ArtifactVerifier:
         try:
             suspect_size = Path(suspect_file_path).stat().st_size
             baseline_size = baseline_path.stat().st_size
+            zoom_output_format = 2 if int(record.scan_params.format_version) >= 2 else 1
 
             # Process each coarse region
             for (
@@ -560,31 +614,28 @@ class ArtifactVerifier:
                 # - Streaming: Read 49GB (minutes)
                 # - Seeking: Instant teleportation
 
-                # Scan baseline at zoom resolution using byte range
-                baseline_temp: Optional[str] = None
-                suspect_temp: Optional[str] = None
+                region_processed = False
                 try:
-                    baseline_albc, baseline_temp = self.scanner.scan(
-                        str(baseline_path),
+                    baseline_albc = self._scan_zoom_slice(
+                        file_path=str(baseline_path),
                         window_size=ZOOM_V1.window_size,
                         step_size=ZOOM_V1.step_size,
                         m=m,
-                        threads=0,
-                        verbose=False,
-                        start_byte=zoom_start,  # Scanner will seek() to this offset
+                        start_byte=zoom_start,
                         end_byte=zoom_end,
+                        output_format=zoom_output_format,
+                        verbose=verbose,
                     )
 
-                    # Scan suspect at zoom resolution
-                    suspect_albc, suspect_temp = self.scanner.scan(
-                        suspect_file_path,
+                    suspect_albc = self._scan_zoom_slice(
+                        file_path=suspect_file_path,
                         window_size=ZOOM_V1.window_size,
                         step_size=ZOOM_V1.step_size,
                         m=m,
-                        threads=0,
-                        verbose=False,
-                        start_byte=zoom_start,  # Scanner will seek() to this offset
+                        start_byte=zoom_start,
                         end_byte=zoom_end,
+                        output_format=zoom_output_format,
+                        verbose=verbose,
                     )
 
                     # Parse and compare zoom barcodes
@@ -642,6 +693,7 @@ class ArtifactVerifier:
                                 )
 
                         zoom_region.fine_regions = fine_regions
+                        region_processed = True
 
                         if verbose:
                             if fine_regions:
@@ -669,19 +721,24 @@ class ArtifactVerifier:
                                     logger.info("      ... and %s more", len(fine_regions) - 3)
                             else:
                                 logger.info("    No fine-grained differences detected")
+                    else:
+                        result.warnings.append(
+                            "Zoom scan parse failed for region "
+                            f"{coarse_start_win}-{coarse_end_win}"
+                        )
+                        if verbose:
+                            logger.warning("    Zoom scan parse failed for this region")
 
                 except Exception as e:
+                    result.warnings.append(
+                        "Zoom scan failed for region "
+                        f"{coarse_start_win}-{coarse_end_win}: {e}"
+                    )
                     if verbose:
                         logger.warning("    Zoom scan failed for this region: %s", e)
-                finally:
-                    for temp_path in (baseline_temp, suspect_temp):
-                        if temp_path:
-                            try:
-                                Path(temp_path).unlink()
-                            except OSError:
-                                pass
 
-                result.zoom_regions.append(zoom_region)
+                if region_processed:
+                    result.zoom_regions.append(zoom_region)
 
         except Exception as e:
             result.warnings.append(f"Zoom scan error: {e}")

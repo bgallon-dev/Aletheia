@@ -407,19 +407,19 @@ The project now follows a primitive-first split:
 ```text
 aletheia/
 +-- core/          # storage-independent primitive API
-¦   +-- barcode.py
-¦   +-- scanner.py
-¦   +-- albc.py
-¦   +-- entropy.py
-¦   +-- types.py
+|   +-- barcode.py
+|   +-- scanner.py
+|   +-- albc.py
+|   +-- entropy.py
+|   +-- types.py
 +-- store/         # repository-backed application layer
-¦   +-- artifacts.py
-¦   +-- repository.py
-¦   +-- verify.py
-¦   +-- identity.py
+|   +-- artifacts.py
+|   +-- repository.py
+|   +-- verify.py
+|   +-- identity.py
 +-- cli/           # command-line interface
-¦   +-- main.py
-¦   +-- formatters.py
+|   +-- main.py
+|   +-- formatters.py
 +-- domain.py
 +-- algorithms.py
 +-- utils.py
