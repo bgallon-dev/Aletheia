@@ -17,8 +17,10 @@ Key Storage:
 import base64
 import hashlib
 import json
+import logging
 import os
 import re
+import sys
 from datetime import datetime
 from pathlib import Path
 from typing import Dict, Any, Optional, Tuple, List
@@ -47,6 +49,53 @@ KEY_FILE_EXTENSION = ".key"
 PUBKEY_FILE_EXTENSION = ".pub"
 KEY_ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$")
 LEGACY_FINGERPRINT_LEN = 16
+
+logger = logging.getLogger(__name__)
+
+
+def _secure_file_permissions(path: Path) -> None:
+    """Restrict file permissions to owner-only access on both Unix and Windows."""
+    if sys.platform == "win32":
+        try:
+            import subprocess
+
+            username = os.environ.get("USERNAME", "")
+            if not username:
+                logger.warning(
+                    "Cannot determine Windows username; "
+                    "private key file may have permissive access: %s",
+                    path,
+                )
+                return
+            # Remove inherited permissions, grant only current user Full Control
+            subprocess.run(
+                [
+                    "icacls",
+                    str(path),
+                    "/inheritance:r",
+                    "/grant:r",
+                    f"{username}:(F)",
+                ],
+                check=True,
+                capture_output=True,
+            )
+        except (subprocess.CalledProcessError, FileNotFoundError) as e:
+            logger.warning(
+                "Failed to set Windows file permissions on %s: %s. "
+                "Private key file may be accessible to other users.",
+                path,
+                e,
+            )
+    else:
+        try:
+            path.chmod(0o600)
+        except OSError as e:
+            logger.warning(
+                "Failed to set file permissions on %s: %s. "
+                "Private key file may be accessible to other users.",
+                path,
+                e,
+            )
 
 
 def validate_key_id(key_id: str) -> None:
@@ -180,11 +229,8 @@ class IdentityLink:
         # Write private key file (restricted permissions)
         private_key_path.write_text(json.dumps(key_file_content, indent=2))
 
-        # Restrict permissions on private key (Unix only)
-        try:
-            os.chmod(private_key_path, 0o600)
-        except (OSError, AttributeError):
-            pass  # Windows doesn't support Unix permissions
+        # Restrict permissions on private key
+        _secure_file_permissions(private_key_path)
 
         # Write public key file (for distribution)
         public_key_content = {
