@@ -50,3 +50,21 @@ def test_contract_exit_codes_match_cli_contract() -> None:
     assert "| `2`  | User error" in contract
     assert "| `3`  | System error" in contract
     assert "| `4`  | Internal/unexpected error" in contract
+
+
+def test_contract_documents_ocr_ingest_features() -> None:
+    contract = _read(CONTRACT_PATH)
+    assert "ingest-dir" in contract
+    assert "metadata.ingested_from" in contract
+    assert "Ingest JSON Result" in contract
+    assert '"status"' in contract
+    assert '"ocr"' in contract
+
+
+def test_ocr_integration_guide_exists_and_documents_entrypoints() -> None:
+    guide = REPO_ROOT / "docs" / "ocr-integration.md"
+    assert guide.exists()
+    text = _read(guide)
+    assert "ingest_file" in text
+    assert "--json" in text
+    assert "ingest-dir" in text

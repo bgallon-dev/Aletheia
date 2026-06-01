@@ -4,6 +4,7 @@ Aletheia Repository CLI - Unified interface for all repository operations.
 """
 
 import argparse
+import fnmatch
 import functools
 import json
 import logging
@@ -12,9 +13,10 @@ import time
 import traceback
 from datetime import datetime
 from pathlib import Path
+from typing import Any, Dict, List, Optional
 
 from ..domain import ArtifactRecord, SchemaValidationError
-from ..ingest import ALBCParser, IngestPipeline, OdinScanner
+from ..ingest import ALBCParser, IngestPipeline, IngestResult, OdinScanner
 from ..store.repository import (
     AletheiaRepository,
     BrokenArtifactError,
@@ -111,6 +113,164 @@ def command_handler(func):
     return wrapper
 
 
+# --- metadata + batch helpers (shared by ingest / ingest-dir) ---
+
+DEFAULT_INGEST_EXCLUDES = ("*.tmp", "*.part", "*.partial", "*.crdownload", ".*")
+
+
+def _coerce_meta_value(value: str) -> Any:
+    """Type a --meta value as a JSON scalar when parseable, else keep the raw string."""
+    try:
+        return json.loads(value)
+    except ValueError:
+        return value
+
+
+def _assign_nested(target: Dict[str, Any], dotted_key: str, value: Any) -> None:
+    """Assign ``value`` into ``target`` following a dotted key path, creating sub-dicts."""
+    parts = dotted_key.split(".")
+    if any(part == "" for part in parts):
+        raise ValueError(f"invalid metadata key '{dotted_key}': empty path segment")
+    node = target
+    for part in parts[:-1]:
+        existing = node.get(part)
+        if existing is None:
+            existing = {}
+            node[part] = existing
+        elif not isinstance(existing, dict):
+            raise ValueError(
+                f"metadata key '{dotted_key}' conflicts with non-object value at '{part}'"
+            )
+        node = existing
+    node[parts[-1]] = value
+
+
+def _deep_merge(base: Dict[str, Any], overlay: Dict[str, Any]) -> Dict[str, Any]:
+    """Recursively merge ``overlay`` into ``base`` (overlay wins). Mutates and returns base."""
+    for key, value in overlay.items():
+        if isinstance(value, dict) and isinstance(base.get(key), dict):
+            _deep_merge(base[key], value)
+        else:
+            base[key] = value
+    return base
+
+
+def _parse_meta_args(
+    meta_pairs: Optional[List[str]], meta_json: Optional[str]
+) -> Dict[str, Any]:
+    """Build a metadata dict from ``--meta-json`` (base) and repeated ``--meta KEY=VALUE``.
+
+    ``--meta`` entries override ``--meta-json``. Dotted keys expand into nested objects and
+    values are JSON-typed when possible. Raises ``ValueError`` on malformed input.
+    """
+    metadata: Dict[str, Any] = {}
+    if meta_json:
+        raw = meta_json
+        if raw.startswith("@"):
+            path = raw[1:]
+            try:
+                raw = Path(path).read_text(encoding="utf-8")
+            except OSError as exc:
+                raise ValueError(f"could not read --meta-json file '{path}': {exc}") from exc
+        try:
+            parsed = json.loads(raw)
+        except ValueError as exc:
+            raise ValueError(f"invalid --meta-json: {exc}") from exc
+        if not isinstance(parsed, dict):
+            raise ValueError("--meta-json must be a JSON object")
+        metadata = parsed
+
+    overlay: Dict[str, Any] = {}
+    for pair in meta_pairs or []:
+        if "=" not in pair:
+            raise ValueError(f"invalid --meta '{pair}': expected KEY=VALUE")
+        key, value = pair.split("=", 1)
+        key = key.strip()
+        if not key:
+            raise ValueError(f"invalid --meta '{pair}': empty key")
+        _assign_nested(overlay, key, _coerce_meta_value(value))
+
+    return _deep_merge(metadata, overlay)
+
+
+def _ingest_result_to_json(result: IngestResult, source: str) -> Dict[str, Any]:
+    """Serialize an IngestResult into the documented machine-readable shape."""
+    return {
+        "artifact_id": result.artifact_id,
+        "status": "duplicate" if result.deduplicated else "new",
+        "signed": result.signed,
+        "content_object_id": result.content_object_id,
+        "barcode_object_id": result.barcode_object_id,
+        "created_at_unix_ms": result.created_at_unix_ms,
+        "original_filename": result.original_filename,
+        "source": source,
+        "record_version": ArtifactRecord.VERSION,
+    }
+
+
+def _iter_ingest_files(
+    directory: Path,
+    includes: List[str],
+    excludes: List[str],
+    recursive: bool,
+) -> List[Path]:
+    """Return the sorted list of regular files under ``directory`` matching the filters."""
+    candidates = directory.rglob("*") if recursive else directory.glob("*")
+    selected: List[Path] = []
+    for path in candidates:
+        if not path.is_file():
+            continue
+        name = path.name
+        if includes and not any(fnmatch.fnmatch(name, pat) for pat in includes):
+            continue
+        if excludes and any(fnmatch.fnmatch(name, pat) for pat in excludes):
+            continue
+        # Skip files nested under a dot-directory (relative to the scan root).
+        parents = path.relative_to(directory).parts[:-1]
+        if any(part.startswith(".") for part in parents):
+            continue
+        selected.append(path)
+    return sorted(selected)
+
+
+def _add_common_ingest_args(parser: argparse.ArgumentParser) -> None:
+    """Attach scan/sign/metadata/output flags shared by ``ingest`` and ``ingest-dir``."""
+    parser.add_argument("--window", type=int, default=65536, help="Window size in bytes")
+    parser.add_argument("--step", type=int, default=16384, help="Step size in bytes")
+    parser.add_argument("--m", type=int, default=1, help="Block size for entropy calculation")
+    parser.add_argument("--threads", type=int, default=0, help="Thread count (0=auto)")
+    parser.add_argument(
+        "--format", type=int, choices=[1, 2], default=1, help="ALBC format version"
+    )
+    parser.add_argument("--keep-temp", action="store_true", help="Keep temporary .albc file")
+    parser.add_argument(
+        "--no-auto-init", action="store_true", help="Fail if repository is not initialized"
+    )
+    parser.add_argument("--sign", metavar="KEY_ID", help="Sign with this key ID")
+    parser.add_argument(
+        "--passphrase", action="store_true", help="Prompt for signing passphrase"
+    )
+    parser.add_argument(
+        "--source",
+        default="local",
+        help="Provenance tag stored as metadata.ingested_from (e.g. 'ocr')",
+    )
+    parser.add_argument(
+        "--meta",
+        action="append",
+        metavar="KEY=VALUE",
+        help="Attach metadata; dotted keys nest (e.g. ocr.page=3). Repeatable.",
+    )
+    parser.add_argument(
+        "--meta-json",
+        metavar="JSON|@FILE",
+        help="Base metadata as a JSON object literal or @path to a JSON file",
+    )
+    parser.add_argument(
+        "--json", action="store_true", help="Emit a machine-readable JSON result to stdout"
+    )
+
+
 @command_handler
 def cmd_init(args: argparse.Namespace) -> int:
     repo_path = Path(args.repo).resolve()
@@ -127,6 +287,10 @@ def cmd_init(args: argparse.Namespace) -> int:
 @command_handler
 def cmd_ingest(args: argparse.Namespace) -> int:
     """Ingest a file into the repository."""
+    json_mode = args.json
+    # Parse metadata before touching the scanner so bad input fails fast.
+    metadata = _parse_meta_args(args.meta, args.meta_json)
+
     passphrase = None
     if args.passphrase and args.sign:
         import getpass
@@ -134,22 +298,114 @@ def cmd_ingest(args: argparse.Namespace) -> int:
         passphrase = getpass.getpass("Enter passphrase for signing key: ")
 
     pipeline = IngestPipeline(repo_root=args.repo, auto_init=not args.no_auto_init)
-    artifact_id = pipeline.ingest(
+    result = pipeline.ingest_result(
         file_path=args.file,
         window_size=args.window,
         step_size=args.step,
         m=args.m,
         threads=args.threads,
-        verbose=args.verbose,
+        verbose=args.verbose and not json_mode,
         keep_temp=args.keep_temp,
         sign_with=args.sign,
         passphrase=passphrase,
         output_format=args.format,
+        source=args.source,
+        metadata=metadata or None,
     )
 
-    if args.verbose:
-        print(f"\nIngested: {artifact_id}")
+    if json_mode:
+        print(json.dumps(_ingest_result_to_json(result, args.source), separators=(",", ":")))
+    elif args.verbose:
+        status = "duplicate" if result.deduplicated else "new"
+        print(f"\nIngested ({status}): {result.artifact_id}")
     return EXIT_OK
+
+
+@command_handler
+def cmd_ingest_dir(args: argparse.Namespace) -> int:
+    """Ingest all matching files in a directory (batch, idempotent)."""
+    json_mode = args.json
+    directory = Path(args.directory)
+    if not directory.is_dir():
+        raise FileNotFoundError(f"Not a directory: {args.directory}")
+
+    metadata = _parse_meta_args(args.meta, args.meta_json)
+
+    excludes = list(args.exclude or [])
+    if not args.no_default_excludes:
+        excludes = list(DEFAULT_INGEST_EXCLUDES) + excludes
+    files = _iter_ingest_files(directory, args.include or [], excludes, args.recursive)
+
+    passphrase = None
+    if args.passphrase and args.sign:
+        import getpass
+
+        passphrase = getpass.getpass("Enter passphrase for signing key: ")
+
+    pipeline = IngestPipeline(repo_root=args.repo, auto_init=not args.no_auto_init)
+
+    results: List[Dict[str, Any]] = []
+    errors: List[Dict[str, str]] = []
+    ingested = duplicates = failed = 0
+    for path in files:
+        try:
+            result = pipeline.ingest_result(
+                file_path=str(path),
+                window_size=args.window,
+                step_size=args.step,
+                m=args.m,
+                threads=args.threads,
+                verbose=args.verbose and not json_mode,
+                keep_temp=args.keep_temp,
+                sign_with=args.sign,
+                passphrase=passphrase,
+                output_format=args.format,
+                source=args.source,
+                metadata=metadata or None,
+            )
+        except Exception as exc:  # isolate per-file failure
+            failed += 1
+            errors.append({"file": str(path), "error": f"{type(exc).__name__}: {exc}"})
+            logger.error("Failed to ingest %s: %s", path, exc)
+            if args.fail_fast:
+                break
+            continue
+        if result.deduplicated:
+            duplicates += 1
+        else:
+            ingested += 1
+        entry = _ingest_result_to_json(result, args.source)
+        entry["file"] = str(path)
+        results.append(entry)
+
+    summary = {
+        "total": len(files),
+        "ingested": ingested,
+        "duplicates": duplicates,
+        "failed": failed,
+    }
+
+    if json_mode:
+        print(
+            json.dumps(
+                {
+                    "directory": str(directory),
+                    "summary": summary,
+                    "results": results,
+                    "errors": errors,
+                },
+                separators=(",", ":"),
+            )
+        )
+    else:
+        print(
+            f"Ingested {ingested}, {duplicates} duplicate(s), {failed} failed "
+            f"of {len(files)} file(s) in {directory}"
+        )
+        for err in errors:
+            print(f"  FAILED {err['file']}: {err['error']}")
+
+    return EXIT_USER_ERROR if failed else EXIT_OK
 
 
 @command_handler
@@ -419,21 +675,36 @@ def cmd_audit(args: argparse.Namespace) -> int:
     return EXIT_VERIFICATION_FAILED if has_issues else EXIT_OK
 
 
+class _DoctorWarning(Exception):
+    """Non-fatal doctor condition: degraded but functional (does not fail health)."""
+
+
 @command_handler
 def cmd_doctor(args: argparse.Namespace) -> int:
     issues = []
+    warnings = []
 
     def check(name, fn):
         try:
             msg = fn()
             print(f"  OK    {name}: {msg}")
+        except _DoctorWarning as w:
+            warnings.append((name, str(w)))
+            print(f"  WARN  {name}: {w}")
         except Exception as e:
             issues.append((name, str(e)))
             print(f"  FAIL  {name}: {e}")
 
     def _binary():
-        s = OdinScanner(require_binary=True)
-        return f"found at '{s.odin_binary}'"
+        from ..core.scanner import probe_scanner
+
+        available, detail = probe_scanner()
+        if available:
+            return f"found at '{detail}'"
+        raise _DoctorWarning(
+            f"native scanner unavailable ({detail}); "
+            "pure-Python entropy fallback will be used for ingest/verify"
+        )
 
     check("Odin binary", _binary)
 
@@ -490,6 +761,9 @@ def cmd_doctor(args: argparse.Namespace) -> int:
     if issues:
         print(f"FAIL  {len(issues)} check(s) failed.")
         return EXIT_SYSTEM_ERROR
+    if warnings:
+        print(f"OK  All checks passed ({len(warnings)} warning(s)).")
+        return EXIT_OK
     print("OK  All checks passed.")
     return EXIT_OK
 
@@ -717,36 +991,38 @@ def main() -> int:
 
     p_ingest = subparsers.add_parser("ingest", help="Ingest a file into the repository")
     p_ingest.add_argument("file", help="File to ingest")
-    p_ingest.add_argument(
-        "--window", type=int, default=65536, help="Window size in bytes"
-    )
-    p_ingest.add_argument("--step", type=int, default=16384, help="Step size in bytes")
-    p_ingest.add_argument(
-        "--m", type=int, default=1, help="Block size for entropy calculation"
-    )
-    p_ingest.add_argument(
-        "--threads", type=int, default=0, help="Thread count (0=auto)"
-    )
-    p_ingest.add_argument(
-        "--format",
-        type=int,
-        choices=[1, 2],
-        default=1,
-        help="ALBC format version",
-    )
-    p_ingest.add_argument(
-        "--keep-temp", action="store_true", help="Keep temporary .albc file"
-    )
-    p_ingest.add_argument(
-        "--no-auto-init",
-        action="store_true",
-        help="Fail if repository is not initialized",
-    )
-    p_ingest.add_argument("--sign", metavar="KEY_ID", help="Sign with this key ID")
-    p_ingest.add_argument(
-        "--passphrase", action="store_true", help="Prompt for signing passphrase"
-    )
+    _add_common_ingest_args(p_ingest)
     p_ingest.set_defaults(func=cmd_ingest)
+
+    p_ingest_dir = subparsers.add_parser(
+        "ingest-dir", help="Ingest all matching files in a directory (batch)"
+    )
+    p_ingest_dir.add_argument("directory", help="Directory to scan for files to ingest")
+    p_ingest_dir.add_argument(
+        "--include",
+        action="append",
+        metavar="GLOB",
+        help="Only ingest files whose name matches this glob (repeatable). Default: all",
+    )
+    p_ingest_dir.add_argument(
+        "--exclude",
+        action="append",
+        metavar="GLOB",
+        help="Skip files whose name matches this glob, added to defaults (repeatable)",
+    )
+    p_ingest_dir.add_argument(
+        "--no-default-excludes",
+        action="store_true",
+        help="Do not apply default temp/partial/dotfile excludes",
+    )
+    p_ingest_dir.add_argument(
+        "--recursive", "-r", action="store_true", help="Recurse into subdirectories"
+    )
+    p_ingest_dir.add_argument(
+        "--fail-fast", action="store_true", help="Stop at the first file that fails to ingest"
+    )
+    _add_common_ingest_args(p_ingest_dir)
+    p_ingest_dir.set_defaults(func=cmd_ingest_dir)
 
     p_verify = subparsers.add_parser(
         "verify", help="Verify a file against its artifact record"

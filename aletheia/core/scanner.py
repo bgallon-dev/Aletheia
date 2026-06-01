@@ -10,7 +10,7 @@ from pathlib import Path
 from shutil import which
 from typing import Any, Dict, Optional, Tuple
 
-from .albc import ALBCParser
+from .albc import ALBCParser, build_albc_bytes
 from .barcode import compute_diff_stats
 from .entropy import quantize_entropy, scan_file_entropy
 from .types import BarcodeResult, ScanParams
@@ -27,10 +27,20 @@ class OdinScanner:
         odin_binary: Optional[str] = None,
         require_binary: bool = True,
     ):
-        if require_binary:
-            self.odin_binary = odin_binary or self._find_binary()
-        else:
-            self.odin_binary = odin_binary or ""
+        if odin_binary:
+            self.odin_binary = odin_binary
+            return
+
+        # Always attempt discovery so a working binary is used when present.
+        # When discovery fails we keep an empty path and defer to the pure-Python
+        # entropy fallback at scan time; only raise when the caller insists the
+        # native binary must exist (require_binary=True, e.g. ``doctor``).
+        try:
+            self.odin_binary = self._find_binary()
+        except FileNotFoundError:
+            if require_binary:
+                raise
+            self.odin_binary = ""
 
     def _find_binary(self) -> str:
         env_path = os.environ.get("ODIN_BINARY")
@@ -59,15 +69,18 @@ class OdinScanner:
         )
 
     def _check_binary(self, path: str) -> bool:
-        if which(path) is not None:
-            return True
-
-        candidate = Path(path)
-        if not candidate.exists():
+        # Resolve via PATH first, then treat ``path`` as a direct/relative path.
+        resolved = which(path)
+        if resolved is None and not Path(path).exists():
             return False
 
+        target = resolved or path
+        # Existence is NOT sufficient: a present-but-unrunnable binary (e.g. blocked
+        # by Windows Application Control / Smart App Control, or wrong architecture)
+        # must be reported as unavailable so callers fall back to the Python scanner
+        # and ``doctor`` reports the real state. Probe by actually invoking it.
         try:
-            result = subprocess.run([str(candidate)], capture_output=True, timeout=2)
+            result = subprocess.run([str(target)], capture_output=True, timeout=5)
             return result.returncode in (0, 2)
         except Exception:
             return False
@@ -85,7 +98,23 @@ class OdinScanner:
         output_format: int = 1,
         timeout_seconds: int = DEFAULT_SCANNER_TIMEOUT_SECONDS,
     ) -> Tuple[bytes, str]:
-        """Run Odin scanner and return ALBC bytes and temporary output path."""
+        """Run Odin scanner and return ALBC bytes and temporary output path.
+
+        Falls back to the pure-Python entropy scanner when the native binary is
+        unavailable (not found, blocked by OS policy, or otherwise unrunnable),
+        so ingest/verify keep working without the compiled binary.
+        """
+        if not self.odin_binary:
+            return self._scan_python_to_albc(
+                file_path,
+                window_size=window_size,
+                step_size=step_size,
+                m=m,
+                output_format=output_format,
+                start_byte=start_byte,
+                end_byte=end_byte,
+            )
+
         with tempfile.NamedTemporaryFile(suffix=".albc", delete=False) as tmp_file:
             tmp_path = tmp_file.name
 
@@ -133,12 +162,61 @@ class OdinScanner:
             raise TimeoutError(
                 f"Scanner timed out after {timeout_seconds}s for file: {file_path}"
             ) from exc
+        except OSError as exc:
+            # Binary could not be launched: missing (WinError 2), blocked by
+            # Application Control (WinError 4551), bad arch, etc. Degrade to the
+            # pure-Python entropy scanner instead of failing the whole operation.
+            Path(tmp_path).unlink(missing_ok=True)
+            logger.warning(
+                "Native Odin scanner could not be executed (%s); "
+                "falling back to pure-Python entropy scanner.",
+                exc,
+            )
+            return self._scan_python_to_albc(
+                file_path,
+                window_size=window_size,
+                step_size=step_size,
+                m=m,
+                output_format=output_format,
+                start_byte=start_byte,
+                end_byte=end_byte,
+            )
         except subprocess.CalledProcessError:
             Path(tmp_path).unlink(missing_ok=True)
             raise
         except Exception:
             Path(tmp_path).unlink(missing_ok=True)
             raise
+
+    def _scan_python_to_albc(
+        self,
+        file_path: str,
+        window_size: int,
+        step_size: int,
+        m: int,
+        output_format: int,
+        start_byte: int = 0,
+        end_byte: int = 0,
+    ) -> Tuple[bytes, str]:
+        """Compute a barcode with the Python scanner and write it as ALBC bytes.
+
+        Mirrors the native ``scan`` contract: returns (albc_bytes, temp_path) so
+        callers can hash the bytes and clean up the temp file as usual.
+        """
+        result = _scan_file_python(
+            file_path=file_path,
+            window_size=window_size,
+            step_size=step_size,
+            m=m,
+            output_format=output_format,
+            start_byte=start_byte,
+            end_byte=end_byte,
+        )
+        albc_bytes = build_albc_bytes(result)
+        with tempfile.NamedTemporaryFile(suffix=".albc", delete=False) as tmp_file:
+            tmp_file.write(albc_bytes)
+            tmp_path = tmp_file.name
+        return albc_bytes, tmp_path
 
     def diff(
         self,
@@ -176,6 +254,21 @@ class OdinScanner:
             "windows_above_threshold": stats.windows_above_threshold,
             "threshold": stats.threshold,
         }
+
+
+def probe_scanner(odin_binary: Optional[str] = None) -> Tuple[bool, str]:
+    """Report native-scanner availability without raising.
+
+    Returns ``(True, path)`` when a runnable native binary is found, or
+    ``(False, reason)`` when scanning will use the pure-Python fallback.
+    """
+    try:
+        scanner = OdinScanner(odin_binary=odin_binary, require_binary=True)
+    except FileNotFoundError as exc:
+        return False, str(exc)
+    if not scanner.odin_binary:
+        return False, "no runnable native scanner binary found"
+    return True, scanner.odin_binary
 
 
 def _parse_scan_result(albc_bytes: bytes, source_path: str) -> BarcodeResult:

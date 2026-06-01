@@ -17,14 +17,17 @@ content-addressed, optionally signed, and stored in an append-only repository.
 
 ### 2.1 Artifacts
 
-| Command   | Primary input                                        |
-|-----------|------------------------------------------------------|
-| `ingest`  | One file path (regular file, any format)             |
-| `verify`  | One file path + `--baseline <artifact_id>`           |
-| `diff`    | Two artifact IDs from stored repository records       |
-| `audit`   | Repository root (no file argument)                   |
+| Command      | Primary input                                        |
+|--------------|------------------------------------------------------|
+| `ingest`     | One file path (regular file, any format)             |
+| `ingest-dir` | One directory + include/exclude globs (batch)        |
+| `verify`     | One file path + `--baseline <artifact_id>`           |
+| `diff`       | Two artifact IDs from stored repository records       |
+| `audit`      | Repository root (no file argument)                   |
 
-Directory-level batch ingest is not yet supported; call `ingest` per file.
+Directory-level batch ingest is supported via `ingest-dir` (see §3.6); for a single file
+call `ingest`. Ingestion is idempotent — re-ingesting identical content is a no-op that
+returns the existing artifact (reported as `status: duplicate`).
 
 ### 2.2 Policy & Configuration
 
@@ -57,6 +60,30 @@ All parameters have CLI equivalents.  Repository-level defaults live in
 | `--passphrase`          | ingest  | Prompt for key passphrase (interactive)        |
 | `--require-signature`   | verify  | Fail if no valid signature is present          |
 | `--no-zoom`             | verify  | Skip fine-resolution zoom scan                 |
+
+#### Provenance, metadata & machine-readable output (ingest / ingest-dir)
+
+| Flag                | Scope             | Description                                                        |
+|---------------------|-------------------|-------------------------------------------------------------------|
+| `--source TAG`      | ingest/ingest-dir | Value stored as `metadata.ingested_from` (default `local`; OCR callers pass `ocr`) |
+| `--meta KEY=VALUE`  | ingest/ingest-dir | Attach metadata (repeatable). Dotted keys nest: `ocr.page=3` → `{"ocr":{"page":3}}`. Values are JSON-typed when parseable (numbers/bools/JSON), else stored as strings. |
+| `--meta-json JSON\|@FILE` | ingest/ingest-dir | Base metadata object as a JSON literal or `@path` to a JSON file. `--meta` entries override it. |
+| `--json`            | ingest/ingest-dir | Emit a single machine-readable JSON result to stdout (see §3.6)    |
+
+#### Batch options (ingest-dir only)
+
+| Flag                    | Default        | Description                                              |
+|-------------------------|----------------|---------------------------------------------------------|
+| `--include GLOB`        | all files      | Only ingest files whose name matches (repeatable)       |
+| `--exclude GLOB`        | —              | Skip files whose name matches, added to defaults (repeatable) |
+| `--no-default-excludes` | off            | Disable the default temp/partial/dotfile excludes       |
+| `--recursive`, `-r`     | off            | Recurse into subdirectories                              |
+| `--fail-fast`           | off            | Stop at the first file that fails (default: continue)    |
+
+Default excludes (unless `--no-default-excludes`): `*.tmp`, `*.part`, `*.partial`,
+`*.crdownload`, `.*` (dotfiles); files nested under a dot-directory are also skipped.
+`original_filename` in the record is always the real file name and cannot be overridden
+via `--meta`/`--meta-json`.
 
 #### Repository config (`config.json`, set at `init` time)
 
@@ -109,6 +136,35 @@ Written to `{repo}/records/{artifact_id}.json` on every successful `ingest`.
 }
 ```
 
+**Metadata fields.** `metadata.original_filename` is authoritative (the real source file
+name) and cannot be overridden by callers. `metadata.ingested_from` defaults to `"local"`
+and is set via `--source` / `ingest_file(source=...)` (OCR pipelines use `"ocr"`). Callers
+may add arbitrary additive metadata; OCR provenance is conventionally namespaced under a
+single optional `metadata.ocr` object:
+
+```jsonc
+"metadata": {
+  "original_filename": "page_0003.txt",
+  "ingested_from": "ocr",
+  "chain_of_custody": "single_node",
+  "ocr": {
+    "source_document_id": "doc-42",   // any subset of these keys; all optional
+    "source_filename":    "scan.pdf",
+    "page":               3,
+    "page_count":         10,
+    "engine":             "tesseract",
+    "engine_version":     "5.3.4",
+    "language":           "eng",
+    "confidence":         0.97,
+    "job_id":             "job-2026-06-01-7",
+    "output_type":        "txt"
+  }
+}
+```
+
+These fields are additive — `record_version` stays `aletheia/ar/1`. The library does not
+validate or require the `ocr` sub-keys.
+
 `identity_link` (when present):
 
 ```jsonc
@@ -152,13 +208,50 @@ Verification Report
 
 ### 3.4 JSON Report (`--json`)
 
-Available on `audit` and `diff`. Written to stdout (redirect to capture).
+Available on `audit`, `diff`, `ingest`, and `ingest-dir`. Written to stdout (redirect to
+capture). When `--json` is set on `ingest`/`ingest-dir`, stdout carries **only** the JSON
+result — all logging goes to stderr — so callers can parse stdout directly.
 
 Audit JSON keys include: `report_type`, `generated_at` (ISO 8601), `repository`,
 `status`, `summary`, `findings`.
 
 Diff JSON keys include: `artifact_id_1`, `artifact_id_2`, `identical`,
 `differing_regions`.
+
+### 3.6 Ingest JSON Result (`ingest --json`, `ingest-dir --json`)
+
+**Single file (`ingest --json`)** — one compact JSON object on stdout:
+
+```jsonc
+{
+  "artifact_id":        "<sha256-hex>",
+  "status":             "new" | "duplicate",   // duplicate == idempotent no-op
+  "signed":             false,                   // true if record carries identity_link
+  "content_object_id":  "<sha256-hex>",
+  "barcode_object_id":  "<sha256-hex>",
+  "created_at_unix_ms":  <int>,
+  "original_filename":  "<string>",
+  "source":             "<string>",             // mirrors --source
+  "record_version":     "aletheia/ar/1"
+}
+```
+
+Both `new` and `duplicate` exit `0` (a duplicate is a successful, idempotent ingest).
+
+**Batch (`ingest-dir --json`)** — one summary object on stdout:
+
+```jsonc
+{
+  "directory": "<path>",
+  "summary":   { "total": <int>, "ingested": <int>, "duplicates": <int>, "failed": <int> },
+  "results":   [ { /* per-file single-file object above */, "file": "<path>" }, ... ],
+  "errors":    [ { "file": "<path>", "error": "<ExceptionType: message>" }, ... ]
+}
+```
+
+Exit code: `0` when no file failed; `2` (user error) if any file failed (the summary is
+still printed to stdout so it doubles as the machine-readable error report). `--fail-fast`
+stops at the first failing file.
 
 ### 3.5 Exit Codes
 
@@ -178,10 +271,10 @@ Exit codes are **stable**. All automated callers should check exit codes, not st
 
 | Effect                                      | Command(s)          | Reversible? |
 |---------------------------------------------|---------------------|-------------|
-| Write content object to `objects/`          | ingest              | No (CAS)    |
-| Write artifact record to `records/`         | ingest              | No (immutable by default) |
-| Update `index.sqlite3`                       | ingest, rebuild     | Via `rebuild` |
-| Write to `tmp/` during scan                 | ingest              | Yes (auto-cleaned after 24 h) |
+| Write content object to `objects/`          | ingest, ingest-dir  | No (CAS)    |
+| Write artifact record to `records/`         | ingest, ingest-dir  | No (immutable by default) |
+| Update `index.sqlite3`                       | ingest, ingest-dir, rebuild | Via `rebuild` |
+| Write to `tmp/` during scan                 | ingest, ingest-dir  | Yes (auto-cleaned after 24 h) |
 | Write key files to `~/.aletheia/keys/`      | identity generate   | Manual delete |
 | **Audit log** (append-only event stream)    | —                   | *Planned — not yet implemented* |
 
@@ -197,7 +290,9 @@ Aletheia never modifies the **source file** passed to `ingest` or `verify`.
 - The ALBC binary magic bytes (`ALBC0001`, `ALBC0002`) identify format versions permanently.
 - Scan parameters stored in a record are always used verbatim during re-verification.
 
-**Not yet stable**: HTML/PDF report output, `--json` schema shape, batch-ingest API.
+**Not yet stable**: HTML/PDF report output, `--json` schema shape (incl. the §3.6 ingest
+result — these are the v0.1 keys and will only be extended additively, but are not yet
+frozen), batch-ingest (`ingest-dir`) behavior.
 
 ---
 

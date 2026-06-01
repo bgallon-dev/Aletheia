@@ -46,7 +46,16 @@ def sliding_entropy(
     step_size: int,
     m_block_size: int = 1,
 ) -> List[float]:
-    """Compute entropy values over a sliding window."""
+    """Compute entropy values over a sliding window.
+
+    Window count follows the paper's Eq(6): ``N_W = 1 + (N - WS)/SS``. When
+    ``(N - WS)`` is not divisible by ``SS`` the trailing partial window is
+    TRUNCATED (floored), not padded as in the paper's Eq(8). Up to ``WS - 1``
+    trailing bytes are therefore not covered by any entropy window; end-to-end
+    integrity of that tail still holds because the exact SHA-256 content hash
+    covers the whole file. Use power-of-two/divisible (WS, SS) (Eq 7) to make
+    every byte fall inside a window.
+    """
     if window_size <= 0:
         raise ValueError("window_size must be > 0")
     if step_size <= 0:

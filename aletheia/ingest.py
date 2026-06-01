@@ -11,7 +11,7 @@ from typing import Optional
 
 from .core.albc import ALBCParser
 from .core.scanner import DEFAULT_SCANNER_TIMEOUT_SECONDS, OdinScanner
-from .store.artifacts import ArtifactRecordBuilder
+from .store.artifacts import ArtifactRecordBuilder, IngestResult
 from .store.artifacts import IngestPipeline as _StoreIngestPipeline
 from .store.repository import AletheiaRepository, RepositoryNotInitializedError
 
@@ -39,7 +39,7 @@ class IngestPipeline(_StoreIngestPipeline):
             odin_binary=odin_binary,
             auto_init=auto_init,
             repository_cls=AletheiaRepository,
-            scanner_factory=lambda binary: OdinScanner(binary),
+            scanner_factory=lambda binary: OdinScanner(binary, require_binary=False),
             identity_factory=identity_factory,
             identity_available=IDENTITY_AVAILABLE,
         )
@@ -52,6 +52,7 @@ __all__ = [
     "DEFAULT_SCANNER_TIMEOUT_SECONDS",
     "IDENTITY_AVAILABLE",
     "IngestPipeline",
+    "IngestResult",
     "OdinScanner",
     "RepositoryNotInitializedError",
 ]

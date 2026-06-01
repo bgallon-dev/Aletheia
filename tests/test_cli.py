@@ -169,3 +169,32 @@ def test_doctor_exits_0_or_3(tmp_path):
 def test_show_still_works_as_alias(tmp_path):
     _run("--repo", str(tmp_path), "init")
     assert _run("--repo", str(tmp_path), "show", "a" * 64).returncode == 2
+
+
+# ---------------------------------------------------------------------------
+# OCR-integration surface: ingest --json/--meta and ingest-dir
+# ---------------------------------------------------------------------------
+
+
+def test_ingest_dir_help_exits_zero():
+    assert _run("ingest-dir", "--help").returncode == 0
+
+
+def test_ingest_help_mentions_json_and_meta():
+    out = _run("ingest", "--help").stdout
+    assert "--json" in out
+    assert "--meta" in out
+    assert "--source" in out
+
+
+def test_ingest_bad_meta_exits_2(tmp_path):
+    """Malformed --meta is rejected before the scanner runs (no binary needed)."""
+    f = tmp_path / "x.bin"
+    f.write_bytes(b"data")
+    r = _run("--repo", str(tmp_path), "ingest", str(f), "--meta", "NOEQUALS")
+    assert r.returncode == 2
+
+
+def test_ingest_dir_missing_directory_exits_2(tmp_path):
+    r = _run("--repo", str(tmp_path), "ingest-dir", str(tmp_path / "nope"))
+    assert r.returncode == 2

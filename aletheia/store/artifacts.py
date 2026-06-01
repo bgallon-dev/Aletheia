@@ -6,6 +6,7 @@ import hashlib
 import json
 import logging
 import uuid
+from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
 from typing import Any, Callable, Dict, Optional, Type, Union
@@ -28,6 +29,24 @@ except ImportError:  # pragma: no cover - optional dependency
 logger = logging.getLogger(__name__)
 
 
+@dataclass(frozen=True)
+class IngestResult:
+    """Outcome of a single ingest operation.
+
+    ``deduplicated`` is ``True`` when the artifact already existed and ingestion was a
+    no-op (idempotent). ``signed`` reflects whether the stored record carries an
+    identity signature.
+    """
+
+    artifact_id: str
+    deduplicated: bool
+    signed: bool
+    content_object_id: str
+    barcode_object_id: str
+    created_at_unix_ms: int
+    original_filename: str
+
+
 class ArtifactRecordBuilder:
     """Builder for Aletheia Artifact Records (aletheia/ar/1)."""
 
@@ -40,19 +59,28 @@ class ArtifactRecordBuilder:
         scan_params: Union[ScanParams, Dict[str, Any]],
         created_at_unix_ms: int,
         original_filename: str,
+        *,
+        source: str = "local",
+        extra_metadata: Optional[Dict[str, Any]] = None,
     ) -> Dict[str, Any]:
         scan_params_obj = (
             scan_params
             if isinstance(scan_params, ScanParams)
             else ScanParams.from_dict(scan_params)
         )
+        metadata = ArtifactRecord.default_metadata(original_filename)
+        metadata["ingested_from"] = source
+        if extra_metadata:
+            metadata = {**metadata, **extra_metadata}
+            # original_filename is authoritative and must not be caller-overridable.
+            metadata["original_filename"] = original_filename
         record = ArtifactRecord(
             record_version=ArtifactRecordBuilder.VERSION,
             content_object_id=content_object_id,
             barcode_object_id=barcode_object_id,
             scan_params=scan_params_obj,
             created_at_unix_ms=created_at_unix_ms,
-            metadata=ArtifactRecord.default_metadata(original_filename),
+            metadata=metadata,
         )
         return record.to_dict()
 
@@ -87,7 +115,9 @@ class IngestPipeline:
         if scanner_factory is not None:
             self.scanner = scanner_factory(odin_binary)
         else:
-            self.scanner = OdinScanner(odin_binary)
+            # require_binary=False: construction succeeds even when the native
+            # binary is absent/blocked; scan() then uses the Python fallback.
+            self.scanner = OdinScanner(odin_binary, require_binary=False)
 
         self.parser = ALBCParser()
         self.identity = None
@@ -110,6 +140,27 @@ class IngestPipeline:
                 return config.get("defaults", {})
         return {}
 
+    def _load_existing_record(self, artifact_id: str) -> Optional[ArtifactRecord]:
+        """Best-effort load of a stored record (used on the idempotent dedupe path).
+
+        Returns ``None`` if the record cannot be read; ingest then stays a successful
+        idempotent no-op (returning partial result fields). Use ``audit`` to detect a
+        genuinely corrupt/missing record.
+        """
+        record_path = self.repo.records_dir / f"{artifact_id}.json"
+        try:
+            with open(record_path, "r") as record_file:
+                raw = json.load(record_file)
+        except (OSError, ValueError) as exc:
+            logger.warning(
+                "Artifact %s... is indexed but its record could not be read (%s); "
+                "returning idempotent duplicate result with partial fields.",
+                artifact_id[:16],
+                exc,
+            )
+            return None
+        return ArtifactRecord.from_dict(raw)
+
     def ingest(
         self,
         file_path: str,
@@ -122,7 +173,45 @@ class IngestPipeline:
         sign_with: Optional[str] = None,
         passphrase: Optional[str] = None,
         output_format: int = 1,
+        *,
+        source: str = "local",
+        metadata: Optional[Dict[str, Any]] = None,
     ) -> str:
+        """Ingest a file and return its artifact_id.
+
+        Backward-compatible thin wrapper around :meth:`ingest_result`.
+        """
+        return self.ingest_result(
+            file_path,
+            window_size=window_size,
+            step_size=step_size,
+            m=m,
+            threads=threads,
+            verbose=verbose,
+            keep_temp=keep_temp,
+            sign_with=sign_with,
+            passphrase=passphrase,
+            output_format=output_format,
+            source=source,
+            metadata=metadata,
+        ).artifact_id
+
+    def ingest_result(
+        self,
+        file_path: str,
+        window_size: int = 65536,
+        step_size: int = 16384,
+        m: int = 1,
+        threads: int = 0,
+        verbose: bool = True,
+        keep_temp: bool = False,
+        sign_with: Optional[str] = None,
+        passphrase: Optional[str] = None,
+        output_format: int = 1,
+        *,
+        source: str = "local",
+        metadata: Optional[Dict[str, Any]] = None,
+    ) -> IngestResult:
         file_path_obj = Path(file_path)
         if not file_path_obj.exists():
             raise FileNotFoundError(f"File not found: {file_path}")
@@ -184,7 +273,20 @@ class IngestPipeline:
                 if verbose:
                     logger.info("Artifact already exists: %s...", artifact_id[:16])
                     logger.info("  Skipping re-ingestion (idempotent operation)")
-                return artifact_id
+                existing = self._load_existing_record(artifact_id)
+                return IngestResult(
+                    artifact_id=artifact_id,
+                    deduplicated=True,
+                    signed=existing.identity_link is not None if existing else False,
+                    content_object_id=content_object_id,
+                    barcode_object_id=barcode_object_id,
+                    created_at_unix_ms=existing.created_at_unix_ms if existing else 0,
+                    original_filename=(
+                        existing.metadata.get("original_filename", file_path_obj.name)
+                        if existing
+                        else file_path_obj.name
+                    ),
+                )
 
             if verbose:
                 logger.info("[5/7] Storing content object (streaming)...")
@@ -218,6 +320,8 @@ class IngestPipeline:
                 scan_params=scan_params,
                 created_at_unix_ms=created_at_unix_ms,
                 original_filename=file_path_obj.name,
+                source=source,
+                extra_metadata=metadata,
             )
 
             if sign_with:
@@ -236,7 +340,15 @@ class IngestPipeline:
             if verbose:
                 logger.info("Successfully ingested: %s", file_path_obj.name)
                 logger.info("  Artifact ID: %s", artifact_id)
-            return artifact_id
+            return IngestResult(
+                artifact_id=artifact_id,
+                deduplicated=False,
+                signed="identity_link" in artifact_record,
+                content_object_id=content_object_id,
+                barcode_object_id=barcode_object_id,
+                created_at_unix_ms=created_at_unix_ms,
+                original_filename=file_path_obj.name,
+            )
         finally:
             if temp_albc_path and not keep_temp:
                 Path(temp_albc_path).unlink(missing_ok=True)

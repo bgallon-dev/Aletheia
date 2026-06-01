@@ -60,6 +60,11 @@ class ZoomRegion:
         # Zoom scan results
         self.fine_regions: List[Tuple[int, int, int, int]] = []
 
+        # Exact byte-level differences (absolute [start, end) byte runs) found by
+        # comparing the baseline content object against the file under test within
+        # the entropy-narrowed region. Empty when content comparison is unavailable.
+        self.exact_diffs: List[Tuple[int, int]] = []
+
 
 class VerificationResult:
     """Result of artifact verification."""
@@ -229,6 +234,23 @@ class VerificationResult:
                         "    No fine-grained differences (coarse mismatch may be quantization artifact)"
                     )
 
+                # Exact byte-level localization (baseline content object vs file).
+                if zoom_region.exact_diffs:
+                    total_changed = sum(e - s for s, e in zoom_region.exact_diffs)
+                    lines.append(
+                        f"\n    Exact byte localization: {len(zoom_region.exact_diffs)} run(s), "
+                        f"{total_changed} byte(s) changed"
+                    )
+                    for k, (diff_start, diff_end) in enumerate(zoom_region.exact_diffs, 1):
+                        run_len = diff_end - diff_start
+                        if run_len == 1:
+                            lines.append(f"      • byte {diff_start} (1 byte)")
+                        else:
+                            lines.append(
+                                f"      • bytes {diff_start} - {diff_end} "
+                                f"({self._format_bytes(run_len)})"
+                            )
+
         # NEW: Signature verification section
         if self.signature_present:
             lines.append("\n[3/3] Identity Link (Signature)")
@@ -261,7 +283,9 @@ class ArtifactVerifier:
             logger.error("Repository initialization failed: %s", e)
             raise
 
-        self.scanner = OdinScanner()
+        # require_binary=False: verify still works via the Python entropy
+        # fallback when the native binary is absent/blocked.
+        self.scanner = OdinScanner(require_binary=False)
         self.parser = ALBCParser()
         self.identity: Optional[IdentityLink] = None
         if IDENTITY_AVAILABLE:
@@ -407,18 +431,37 @@ class ArtifactVerifier:
                     result.barcode_hash_expected, obj_type_hint="barcode"
                 )
                 if stored_albc:
-                    # Parse both barcodes
-                    stored_parsed = self.parser.parse_full(stored_albc)
-                    actual_parsed = self.parser.parse_full(albc_bytes)
+                    # Parse both barcodes, including raw f64 entropy when present.
+                    stored_parsed = self.parser.parse_full_with_raw(stored_albc)
+                    actual_parsed = self.parser.parse_full_with_raw(albc_bytes)
 
                     if stored_parsed and actual_parsed:
-                        # Compare payloads and get coarse localization
-                        result.localization = self.parser.compare_barcodes(
-                            stored_parsed["barcode_payload"],
-                            actual_parsed["barcode_payload"],
-                            window_size,
-                            step_size,
-                        )
+                        stored_raw = stored_parsed.get("raw_entropy")
+                        actual_raw = actual_parsed.get("raw_entropy")
+                        if (
+                            isinstance(stored_raw, list)
+                            and isinstance(actual_raw, list)
+                            and len(stored_raw) == len(actual_raw)
+                            and len(stored_raw) > 0
+                        ):
+                            # Format 2: compare raw f64 entropy so sub-quantization
+                            # changes (entropy delta below the u8 step of ~8m/255)
+                            # are still localized instead of silently vanishing.
+                            result.localization = self.parser.compare_barcodes_raw(
+                                stored_raw,
+                                actual_raw,
+                                window_size,
+                                step_size,
+                                threshold=ZOOM_V1.raw_threshold,
+                            )
+                        else:
+                            # Format 1: only the quantized u8 payload is available.
+                            result.localization = self.parser.compare_barcodes(
+                                stored_parsed["barcode_payload"],
+                                actual_parsed["barcode_payload"],
+                                window_size,
+                                step_size,
+                            )
 
                         if verbose and result.localization:
                             logger.info(
@@ -737,13 +780,104 @@ class ArtifactVerifier:
                     if verbose:
                         logger.warning("    Zoom scan failed for this region: %s", e)
 
-                if region_processed:
+                # Exact byte-level localization within the entropy-narrowed range.
+                # Entropy windowing can only resolve to ~WS bytes; since we hold the
+                # baseline content object and have already teleported to this region,
+                # an exact byte comparison pins the precise offset(s) that changed.
+                try:
+                    zoom_region.exact_diffs = self._exact_byte_diff(
+                        baseline_path, suspect_file_path, zoom_start, zoom_end
+                    )
+                    if verbose and zoom_region.exact_diffs:
+                        total = sum(e - s for s, e in zoom_region.exact_diffs)
+                        logger.info(
+                            "    Exact byte diff: %s run(s), %s byte(s) changed",
+                            len(zoom_region.exact_diffs),
+                            f"{total:,}",
+                        )
+                except Exception as e:
+                    if verbose:
+                        logger.warning("    Exact byte diff failed for this region: %s", e)
+
+                # Append if entropy zoom processed the region OR the exact diff found
+                # something (so sub-quantization changes are reported even when the
+                # entropy parse yielded nothing).
+                if region_processed or zoom_region.exact_diffs:
                     result.zoom_regions.append(zoom_region)
 
         except Exception as e:
             result.warnings.append(f"Zoom scan error: {e}")
             if verbose:
                 logger.warning("  Zoom scan encountered error: %s", e)
+
+    @staticmethod
+    def _exact_byte_diff(
+        baseline_path,
+        suspect_path: str,
+        start: int,
+        end: int,
+        gap_merge: int = 8,
+        chunk_size: int = 65536,
+        max_bytes: int = 256 * 1024 * 1024,
+    ) -> List[Tuple[int, int]]:
+        """Return absolute [start, end) byte runs that differ between baseline and suspect.
+
+        Compares only the bytes in ``[start, end)`` (the entropy-narrowed region),
+        reading from both files via ``seek`` so the whole-file teleport benefit is
+        preserved. Equal chunks are compared at C speed and skipped; only chunks that
+        differ are scanned byte-by-byte. Differing positions within ``gap_merge`` bytes
+        of each other are merged into one run. Coverage is capped at ``max_bytes``.
+
+        Note: this assumes substitution alignment (same offsets). Insertions/deletions
+        shift content and would widen the reported runs; SHA-256 still guarantees the
+        change is detected regardless.
+        """
+        length = min(end - start, max_bytes)
+        if length <= 0:
+            return []
+
+        runs: List[Tuple[int, int]] = []
+        run_start: Optional[int] = None
+        run_last: Optional[int] = None
+
+        def _flush() -> None:
+            nonlocal run_start, run_last
+            if run_start is not None and run_last is not None:
+                runs.append((run_start, run_last + 1))
+            run_start = None
+            run_last = None
+
+        with open(baseline_path, "rb") as bf, open(suspect_path, "rb") as sf:
+            bf.seek(start)
+            sf.seek(start)
+            pos = start
+            remaining = length
+            while remaining > 0:
+                want = min(chunk_size, remaining)
+                b = bf.read(want)
+                s = sf.read(want)
+                span = max(len(b), len(s))
+                if span == 0:
+                    break
+                if b != s:
+                    for i in range(span):
+                        bb = b[i] if i < len(b) else None
+                        ss = s[i] if i < len(s) else None
+                        if bb != ss:
+                            abs_pos = pos + i
+                            if run_start is None:
+                                run_start = abs_pos
+                            elif run_last is not None and abs_pos - run_last > gap_merge:
+                                _flush()
+                                run_start = abs_pos
+                            run_last = abs_pos
+                elif run_start is not None:
+                    # An all-equal chunk guarantees a gap larger than gap_merge.
+                    _flush()
+                pos += span
+                remaining -= want
+        _flush()
+        return runs
 
     @staticmethod
     def _format_file_size(byte_count: int) -> str:
